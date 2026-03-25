@@ -1,0 +1,53 @@
+独立主机多智能体开发团队 (Agentic Workflow) 架构与实现指南
+【角色设定】
+你现在是一位资深的 AI 工程师与全栈开发专家。我的目标是在一台拥有完全控制权的独立 Linux 主机上，搭建一个类似 ChatDev / AutoGen 的多智能体软件开发协作团队。请根据以下架构设计，为我编写核心的中控调度系统代码。
+
+【系统运行环境与核心约束】
+
+宿主机直连（无沙盒隔离）：代码和 Agent 将直接在我的独立 Linux 主机上运行。绝对不需要 Docker 或虚拟沙盒（如设定 use_docker=False）。Agent 拥有直接操作底层文件系统、执行 Shell 命令、跑单测的权限。所有的文本编辑指令必须且只能使用 vi 或 vim（严禁使用 nano）。
+
+交互界面（ChatOps）：不需要前端 Web 页面。我将通过 Telegram 群聊 监控他们的工作并进行自然语言交互。我会在群里发需求，Agent 也会在群里汇报进度、贴报错截图和互相 Review。
+
+中控底座：采用纯 Python 编写调度器（如 tg_orchestrator.py），结合 Microsoft AutoGen（负责 Agent 路由与群聊逻辑）和 python-telegram-bot（负责与我的手机端通信）。
+
+【算力资源与角色分配 (Agent Roster)】
+我手头有三家不同厂商的 AI 算力，为了防止“模型认知回音壁”并最大化利用额度，角色必须严格按以下配置：
+
+角色 1：PM / Context Router（项目经理）
+
+驱动模型：本地已通过 OAuth 登录的 Gemini Pro CLI 工具。
+
+职责：处理海量上下文。负责将我输入的模糊需求拆解为结构化的 Task 列表；在发生严重编译错误时，负责阅读动辄几千行的日志，提取精简上下文。
+
+调用方式：在 Python 代码中通过 subprocess 后台静默调用该 CLI 及其标准输出。
+
+角色 2：The Devs（核心开发工程师，建议分配 2 个实例如 dev-1, dev-2）
+
+驱动模型：Codex (OpenAI API)。由于其额度极大，负责所有高频、重体力的工作。
+
+职责：疯狂写代码、执行本地命令、跑测试。遇到报错就利用高额度进行高频自我纠错重试（Trial and Error）。
+
+角色 3：The Architect（首席架构师/Reviewer）
+
+驱动模型：Anthropic Claude (Sonnet 或 Opus API)。额度较小，属于稀缺资源。
+
+职责：平时保持静默。只有在 Dev 提交 PR 请求 Review，或者重试超过 5 次陷入死循环时才被唤醒介入。负责一针见血的架构指导和安全漏洞排查，掌握最终合并否决权。
+
+【核心执行流 (Event Loop)】
+
+人类输入：我在 Telegram 群发送 @pm 帮我给项目加上 Redis 缓存机制。
+
+监听与路由：Python 脚本捕获消息，通过 AutoGen 的 GroupChatManager 唤醒 PM (Gemini)。
+
+任务拆解：PM 吐出步骤，并 @dev-1 去执行。
+
+编码与试错：Dev (Codex) 在本地宿主机建目录、写代码、运行测试。如果报错，Dev 会在群里输出精简日志并自己再去改。
+
+评审与终结：Dev 认为完成了，请求 @architect 审查。Architect (Claude) 阅读代码，回复 LGTM (Looks Good To Me) 或提出修改意见。我可以在手机上随时围观或打断。
+
+【你的任务】
+请基于上述完整的上下文，为我提供第一阶段的代码实现方案。重点包括：
+
+如何初始化 GroupChat 和这三种异构的 Agent？
+
+如何在 Python 中优雅地把本地的 Gemini CLI 包装成一个可以被 AutoGen 调用的 Tool？

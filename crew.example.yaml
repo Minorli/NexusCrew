@@ -1,0 +1,76 @@
+# crew.example.yaml — NexusCrew 编组配置
+# 命名规范：{project_prefix}-{role}-{序号}
+# 例：nexus-pm-01, nexus-dev-01, nexus-dev-02, nexus-arch-01
+
+project_dir: ~/myproject
+project_prefix: nexus          # 用于 Bot @username 前缀，可改为项目名
+
+agents:
+  # ── PM 兼 PO（项目经理 + 产品经理）──────────────────────────────
+  # 走 Gemini OAuth 线路，大上下文，负责需求理解、任务拆解、产品决策
+  - role: pm
+    name: nexus-pm-01
+    model: gemini
+    gemini_model: gemini-2.5-pro    # 传入 CLI 的 --model 参数
+    system_prompt_extra: |
+      你同时兼任产品经理（PO）角色：
+      - 对模糊需求有权做产品层面的决策和取舍
+      - 输出任务时需注明优先级（P0/P1/P2）
+      - 关注用户价值，不只是技术实现
+      本项目技术栈：（启动后由 ProjectScanner 自动填充）
+
+  # ── Dev Agent ────────────────────────────────────────────────────
+  # 走 OpenAI Codex 线路，高频调用，Trial & Error 模式
+  - role: dev
+    name: nexus-dev-01
+    model: codex
+    openai_model: gpt-4.5           # 常规任务
+    # openai_model: gpt-4.5-xhigh  # 复杂任务时切换
+
+  - role: dev
+    name: nexus-dev-02
+    model: codex
+    openai_model: gpt-4.5
+
+  # ── Architect Agent ───────────────────────────────────────────────
+  # 走 Anthropic 线路，稀缺资源，仅 Review 和求助时介入
+  - role: architect
+    name: nexus-arch-01
+    model: claude
+    anthropic_model: claude-opus-4-6          # 重大架构决策，extended thinking
+    anthropic_model_light: claude-sonnet-4-6  # 常规 Review 降级选项
+    system_prompt_extra: |
+      优先使用 extended thinking 模式处理架构级问题。
+      轻量 Code Review 可使用 Sonnet 节省额度。
+
+  # ── HR Agent（技术型管理 HRBP）─────────────────────────────────
+  # 走 Gemini OAuth 线路，大上下文分析对话历史和绩效数据
+  # 观察者角色，不参与技术实现，事件驱动 + 定时触发
+  - role: hr
+    name: nexus-hr-01
+    model: gemini
+    gemini_model: gemini-2.5-pro
+    system_prompt_extra: |
+      你的绩效评估周期为每完成一个完整任务链后自动触发。
+      关注以下核心指标：任务完成率、首次通过率、平均响应时间、代码质量评分。
+      使用阿里 361 绩效体系（3.25/3.5/3.75）进行评分。
+      督促消息需 @目标Agent 并抄送 @PM，重大问题 @Human。
+
+orchestrator:
+  max_chain_hops: 10
+  max_dev_retry: 5
+  history_window: 20
+  memory_tail_lines: 120
+  shell_timeout: 120
+
+hr:
+  eval_per_task: true             # 每个任务链结束后自动评估
+  summary_interval: 5             # 每 5 个任务链生成阶段性汇总
+  pressure_cooldown: 2            # 同一 Agent 督促间隔（任务链数）
+  pressure_max_prompt_len: 500    # 注入 prompt 最大字数
+  pressure_ttl: 3                 # 督促信息过期周期（任务链数）
+  anomaly_triggers:
+    dev_retry_threshold: 3        # Dev retry ≥3 触发预警
+    review_reject_threshold: 2    # 连续被打回 ≥2 触发预警
+    response_time_threshold: 120  # 响应超时阈值（秒）
+    chain_hops_threshold: 8       # 链路过长预警
