@@ -33,6 +33,10 @@ class TestDetectFirst:
         router = _setup(_agent("dave", "architect"))
         assert router.detect_first("@arch Code Review").name == "dave"
 
+    def test_role_alias_hr(self):
+        router = _setup(_agent("nexus-hr-01", "hr"))
+        assert router.detect_first("@hr 出绩效报告").name == "nexus-hr-01"
+
     def test_no_mention_returns_none(self):
         router = _setup(_agent("alice", "pm"))
         assert router.detect_first("没有 mention 的消息") is None
@@ -47,6 +51,10 @@ class TestDetectFirst:
         result = router.detect_first("@dev 来")
         assert result.name == "dev"
         assert result.role == "pm"
+
+    def test_exact_hr_name_match(self):
+        router = _setup(_agent("nexus-hr-01", "hr"), _agent("alice", "pm"))
+        assert router.detect_first("@nexus-hr-01 评估 dev").name == "nexus-hr-01"
 
 
 class TestDetectAll:

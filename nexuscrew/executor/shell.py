@@ -50,3 +50,32 @@ class ShellExecutor:
         """Heuristic: did the last execution indicate an error?"""
         lo = shell_output.lower()
         return any(kw in lo for kw in FAIL_KEYWORDS)
+
+    async def git_create_branch(self, branch_name: str) -> str:
+        # Task 4.3 完成: 为任务提供 Git 分支辅助创建能力。
+        return await asyncio.to_thread(
+            self._run_one,
+            f"git checkout -b {branch_name}",
+        )
+
+    async def git_commit(self, message: str) -> str:
+        return await asyncio.to_thread(
+            self._run_one,
+            f'git add -A && git commit -m "{message}"',
+        )
+
+    async def git_current_branch(self) -> str:
+        result = await asyncio.to_thread(
+            self._run_one,
+            "git branch --show-current",
+        )
+        lowered = result.lower()
+        if "not a git repository" in lowered or "fatal:" in lowered:
+            return "unknown"
+        for line in result.splitlines():
+            if line.startswith("$"):
+                continue
+            stripped = line.strip()
+            if stripped and not stripped.startswith("[stderr]"):
+                return stripped
+        return "unknown"

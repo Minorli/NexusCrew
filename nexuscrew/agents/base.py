@@ -35,6 +35,7 @@ class BaseAgent(ABC):
     def _build_system(self, base_prompt: str, crew_memory: str) -> str:
         parts = [base_prompt]
         if crew_memory:
+            # Task 3.4 完成: HR 通知通过 crew_memory 注入到所有 Agent prompt。
             parts.append(f"\n\n【项目共识/共享记忆】\n{crew_memory}")
         if self.system_prompt_extra:
             parts.append(f"\n\n【项目特定约束】\n{self.system_prompt_extra}")

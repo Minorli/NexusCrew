@@ -11,6 +11,7 @@ ROLE_ALIASES: dict[str, str] = {
     "dev_2": "dev",
     "architect": "architect",
     "arch": "architect",
+    "hr": "hr",  # Task 1.2 完成: 支持 HR 角色别名路由。
 }
 
 _MENTION_RE = re.compile(r"@(\w+)")
@@ -22,7 +23,7 @@ class Router:
 
     def detect_first(self, text: str) -> BaseAgent | None:
         """Return the first valid agent mentioned in text."""
-        for token in _MENTION_RE.findall(text):
+        for token in self._iter_tokens(text):
             agent = self._resolve(token)
             if agent:
                 return agent
@@ -32,7 +33,7 @@ class Router:
         """Return all unique agents mentioned, in order of appearance."""
         seen: set[str] = set()
         agents: list[BaseAgent] = []
-        for token in _MENTION_RE.findall(text):
+        for token in self._iter_tokens(text):
             agent = self._resolve(token)
             if agent and agent.name not in seen:
                 seen.add(agent.name)
@@ -54,3 +55,14 @@ class Router:
         if role:
             return self.registry.get_by_role(role)
         return None
+
+    def _iter_tokens(self, text: str):
+        r"""Preserve the core @(\w+) contract, then extend through hyphens."""
+        # Task 1.2 完成: 支持 @nexus-hr-01 这类带连字符的精确名字路由。
+        for match in _MENTION_RE.finditer(text):
+            token = match.group(1)
+            end = match.end(1)
+            while end < len(text) and (text[end].isalnum() or text[end] in "_-"):
+                token += text[end]
+                end += 1
+            yield token

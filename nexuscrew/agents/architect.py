@@ -30,7 +30,13 @@ class ArchitectAgent(BaseAgent):
             messages.append({"role": role, "content": m["content"][:800]})
         messages.append({"role": "user", "content": message})
 
-        reply = await asyncio.to_thread(self.backend.complete, system, messages)
+        reply = await asyncio.to_thread(
+            self.backend.complete,
+            system,
+            messages,
+            self._should_use_thinking(message),
+            self._should_use_light(message),
+        )
 
         artifacts = AgentArtifacts()
         if "【MEMORY】" in reply:
@@ -38,3 +44,12 @@ class ArchitectAgent(BaseAgent):
             reply = reply.strip()
             artifacts.memory_note = artifacts.memory_note.strip()
         return reply, artifacts
+
+    def _should_use_thinking(self, message: str) -> bool:
+        # Task 4.1 完成: 架构级/安全级问题启用 extended thinking。
+        heavy_keywords = ["架构", "设计", "安全", "性能", "重构", "迁移", "方案"]
+        return any(keyword in message for keyword in heavy_keywords)
+
+    def _should_use_light(self, message: str) -> bool:
+        light_keywords = ["LGTM", "review", "Review", "检查", "看一下", "PR"]
+        return any(keyword in message for keyword in light_keywords)
