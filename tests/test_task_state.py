@@ -41,6 +41,7 @@ def test_orchestrator_tracks_review_flow(tmp_path: Path, monkeypatch):
         return "ok"
 
     monkeypatch.setattr(executor, "git_create_branch", fake_git_create_branch)
+    monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
     orchestrator = Orchestrator(
         registry,
         Router(registry),

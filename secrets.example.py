@@ -43,3 +43,42 @@ GEMINI_MODEL       = "gemini-2.5-pro" # CLI 内部模型，通过 --model 参数
 
 # ── 运行时 ──────────────────────────────────────────────────────────
 WORKSPACE_DIR = "."                  # Dev 执行根目录
+
+# ── GitHub Sync（可选，但推荐开启，用于把任务链沟通沉淀到 issue / PR） ───────
+GITHUB_SYNC_ENABLED = False
+GITHUB_API_URL = "https://api.github.com"
+GITHUB_TOKEN = "ghp_YOUR_GITHUB_TOKEN"
+GITHUB_REPO = "owner/repo"
+GITHUB_ISSUE_LABELS = ["nexuscrew", "task-log"]
+GITHUB_ISSUE_TITLE_PREFIX = "NexusCrew"
+GITHUB_WEBHOOK_ENABLED = False
+GITHUB_WEBHOOK_HOST = "127.0.0.1"
+GITHUB_WEBHOOK_PORT = 8788
+GITHUB_WEBHOOK_SECRET = "your-webhook-secret"
+
+# ── Slack Sync（可选，企业协作面） ────────────────────────────────────
+SLACK_SYNC_ENABLED = False
+SLACK_API_URL = "https://slack.com/api"
+SLACK_BOT_TOKEN = "xoxb-your-slack-bot-token"
+SLACK_DEFAULT_CHANNEL = "C0123456789"
+SLACK_TITLE_PREFIX = "NexusCrew"
+SLACK_COMMANDS_ENABLED = False
+SLACK_COMMANDS_HOST = "127.0.0.1"
+SLACK_COMMANDS_PORT = 8789
+SLACK_SIGNING_SECRET = "your-slack-signing-secret"
+SLACK_APP_HOME_ENABLED = False
+SLACK_APP_HOME_USER_IDS: list[str] = []
+SLACK_APP_HOME_REFRESH_SECONDS = 0
+SLACK_DEFAULT_CHAT_ID = 0
+
+# ── 企业控制面（可选） ───────────────────────────────────────────────
+TELEGRAM_OPERATOR_USER_IDS: list[int] = []
+TELEGRAM_APPROVER_USER_IDS: list[int] = []
+TELEGRAM_ADMIN_USER_IDS: list[int] = []
+
+DASHBOARD_ENABLED = False
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_PORT = 8787
+
+AUTO_RECOVER_BACKGROUND_RUNS = False
+SYSTEM_NOTIFICATION_CHAT_ID = 0

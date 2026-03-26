@@ -60,6 +60,7 @@ def test_orchestrator_collects_dev_shell_failure_metrics(tmp_path: Path, monkeyp
         return "ok"
 
     monkeypatch.setattr(executor, "git_create_branch", fake_git_create_branch)
+    monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
     orchestrator = Orchestrator(
         registry,
         Router(registry),
@@ -95,6 +96,7 @@ def test_orchestrator_records_architect_review_result(tmp_path: Path, monkeypatc
         return "ok"
 
     monkeypatch.setattr(executor, "git_create_branch", fake_git_create_branch)
+    monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
     orchestrator = Orchestrator(
         registry,
         Router(registry),

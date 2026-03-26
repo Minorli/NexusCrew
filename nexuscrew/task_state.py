@@ -33,6 +33,14 @@ class Task:
     description: str
     status: TaskStatus = TaskStatus.PLANNING
     assigned_to: str = ""
+    branch_name: str = ""
+    github_issue_number: int = 0
+    github_issue_url: str = ""
+    github_pr_number: int = 0
+    github_pr_url: str = ""
+    slack_channel: str = ""
+    slack_message_ts: str = ""
+    slack_thread_ts: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = ""
     history: list[str] = field(default_factory=list)
@@ -64,6 +72,14 @@ class TaskTracker:
         task = Task(id=task_id, description=description)
         self._tasks.setdefault(chat_id, {})[task_id] = task
         return task
+
+    def restore(self, chat_id: int, task: Task) -> None:
+        self._tasks.setdefault(chat_id, {})[task.id] = task
+        try:
+            numeric = int(task.id.split("-")[-1])
+            self._counter[chat_id] = max(self._counter.get(chat_id, 0), numeric)
+        except ValueError:
+            pass
 
     def get(self, chat_id: int, task_id: str) -> Task | None:
         return self._tasks.get(chat_id, {}).get(task_id)

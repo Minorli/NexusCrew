@@ -3,6 +3,10 @@ import asyncio
 import re
 import subprocess
 from pathlib import Path
+from ..hooks import HookManager
+from ..policy.approval import ApprovalManager
+from ..policy.risk import RiskLevel, classify_script
+from ..runtime.sqlite_store import DurableStateStore
 
 _BLOCK_RE = re.compile(r"```(?:bash|sh)\n(.*?)\n```", re.DOTALL)
 FAIL_KEYWORDS = ("error", "traceback", "failed", "exception", "command not found",
@@ -13,6 +17,13 @@ class ShellExecutor:
     def __init__(self, work_dir: Path, timeout: int = 120):
         self.work_dir = work_dir
         self.timeout = timeout
+        self.state_store = DurableStateStore(self.work_dir / ".nexuscrew_state.db")
+        self.approval_manager = ApprovalManager(state_store=self.state_store)
+        self.hook_manager = HookManager(self.work_dir / ".nexus_audit.jsonl")
+        self._context = {"chat_id": 0, "task_id": "", "run_id": ""}
+
+    def set_context(self, chat_id: int, task_id: str, run_id: str):
+        self._context = {"chat_id": chat_id, "task_id": task_id, "run_id": run_id}
 
     async def run_blocks(self, text: str) -> str:
         """Extract all ```bash blocks from text and run them sequentially."""
@@ -21,7 +32,38 @@ class ShellExecutor:
             return ""
         results = []
         for code in blocks:
+            risk = classify_script(code)
+            if risk >= RiskLevel.HIGH:
+                approval = self.approval_manager.create_request(
+                    action_type="shell",
+                    risk_level=risk,
+                    summary=code.splitlines()[0][:80] if code.splitlines() else "shell block",
+                    payload={
+                        "code": code,
+                        "work_dir": str(self.work_dir),
+                        **self._context,
+                    },
+                )
+                self.hook_manager.emit(
+                    "approval_requested",
+                    f"{approval.id} {approval.summary}",
+                    {"risk_level": approval.risk_level, **approval.payload},
+                )
+                results.append(
+                    f"[approval required: {approval.id}] risk={approval.risk_level}\n{approval.summary}"
+                )
+                continue
+            self.hook_manager.emit(
+                "shell_before_execute",
+                code.splitlines()[0][:80] if code.splitlines() else "shell block",
+                {"risk_level": risk.name.lower(), **self._context},
+            )
             out = await asyncio.to_thread(self._run_one, code)
+            self.hook_manager.emit(
+                "shell_after_execute",
+                code.splitlines()[0][:80] if code.splitlines() else "shell block",
+                {"output": out[:500], **self._context},
+            )
             results.append(out)
         return "\n\n".join(results)
 
@@ -53,12 +95,22 @@ class ShellExecutor:
 
     async def git_create_branch(self, branch_name: str) -> str:
         # Task 4.3 完成: 为任务提供 Git 分支辅助创建能力。
+        self.hook_manager.emit(
+            "git_before_execute",
+            f"create_branch {branch_name}",
+            {"risk_level": "medium", **self._context},
+        )
         return await asyncio.to_thread(
             self._run_one,
             f"git checkout -b {branch_name}",
         )
 
     async def git_commit(self, message: str) -> str:
+        self.hook_manager.emit(
+            "git_before_execute",
+            f"commit {message[:60]}",
+            {"risk_level": "medium", **self._context},
+        )
         return await asyncio.to_thread(
             self._run_one,
             f'git add -A && git commit -m "{message}"',
@@ -79,3 +131,38 @@ class ShellExecutor:
             if stripped and not stripped.startswith("[stderr]"):
                 return stripped
         return "unknown"
+
+    def list_pending_approvals(self):
+        return self.approval_manager.list_pending()
+
+    async def approve_and_run(self, approval_id: str) -> str:
+        request = self.approval_manager.approve(approval_id)
+        if request is None:
+            return f"未找到审批: {approval_id}"
+        if request.status != "approved":
+            return f"审批状态无效: {request.status}"
+        self.hook_manager.emit(
+            "approval_approved",
+            approval_id,
+            request.payload,
+        )
+        result = await asyncio.to_thread(self._run_one, request.payload["code"])
+        request.transition("executed")
+        self.approval_manager._persist(request)
+        self.hook_manager.emit(
+            "approval_executed",
+            approval_id,
+            {"output": result[:500], **request.payload},
+        )
+        return result
+
+    def reject(self, approval_id: str) -> str:
+        request = self.approval_manager.reject(approval_id)
+        if request is None:
+            return f"未找到审批: {approval_id}"
+        self.hook_manager.emit(
+            "approval_rejected",
+            approval_id,
+            request.payload,
+        )
+        return f"审批 {approval_id} 已拒绝。"

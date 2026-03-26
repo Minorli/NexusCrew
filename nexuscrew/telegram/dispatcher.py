@@ -1,8 +1,10 @@
 """Multi-Bot dispatcher — receives via one bot, sends via per-agent bots."""
 from telegram import Bot
 
+from ..local_secrets import load_local_secrets
 from .formatter import chunk
-import secrets as cfg
+
+cfg = load_local_secrets()
 
 
 class AgentBotPool:

@@ -42,6 +42,7 @@ def test_orchestrator_creates_feature_branch_for_dev_task(tmp_path: Path, monkey
         return "ok"
 
     monkeypatch.setattr(executor, "git_create_branch", fake_git_create_branch)
+    monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
     orchestrator = Orchestrator(
         registry,
         Router(registry),
