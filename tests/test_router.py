@@ -1,4 +1,5 @@
 """Tests for Router — @mention parsing, role aliases, default fallback."""
+from nexuscrew import router as router_module
 from nexuscrew.agents.base import BaseAgent, AgentArtifacts
 from nexuscrew.registry import AgentRegistry
 from nexuscrew.router import Router
@@ -55,6 +56,16 @@ class TestDetectFirst:
     def test_exact_hr_name_match(self):
         router = _setup(_agent("nexus-hr-01", "hr"), _agent("alice", "pm"))
         assert router.detect_first("@nexus-hr-01 评估 dev").name == "nexus-hr-01"
+
+    def test_bot_username_maps_to_agent_name(self, monkeypatch):
+        monkeypatch.setattr(
+            router_module.cfg,
+            "BOT_USERNAME_MAP",
+            {"nexus_dev_02_bot": "nexus-dev-02"},
+            raising=False,
+        )
+        router = _setup(_agent("nexus-dev-02", "dev"), _agent("alice", "pm"))
+        assert router.detect_first("@nexus_dev_02_bot 你呢").name == "nexus-dev-02"
 
 
 class TestDetectAll:

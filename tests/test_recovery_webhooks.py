@@ -64,7 +64,7 @@ def test_recovery_manager_recovers_interrupted_job(tmp_path: Path):
     asyncio.run(RecoveryManager(runner, orchestrator).recover(send_factory))
 
     assert recovered_jobs == ["BG-0001"]
-    assert runner.get("BG-0001").status in ("running", "completed", "failed")
+    assert runner.get("BG-0001").status in ("running", "completed", "failed", "cancelled")
 
 
 def test_recovery_manager_marks_failed_resume(tmp_path: Path):

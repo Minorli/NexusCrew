@@ -1,6 +1,7 @@
 """Minimal Slack Web API client."""
 import json
 import urllib.request
+from ..http_retry import with_retries
 
 
 class SlackClient:
@@ -21,14 +22,17 @@ class SlackClient:
         return self._post("views.publish", {"user_id": user_id, "view": view})
 
     def _post(self, method: str, payload: dict) -> dict:
-        request = urllib.request.Request(
-            f"{self.api_url}/{method}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        def do_request():
+            request = urllib.request.Request(
+                f"{self.api_url}/{method}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        return with_retries(do_request)

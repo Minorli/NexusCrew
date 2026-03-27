@@ -35,7 +35,7 @@ ANTHROPIC_MODEL_OPUS   = "claude-opus-4-6"          # Code Review / 重大决策
 ANTHROPIC_MODEL_SONNET = "claude-sonnet-4-6"        # 轻量审查降级
 ANTHROPIC_MODEL        = ANTHROPIC_MODEL_OPUS        # 当前使用的默认（bot.py 读取此变量）
 
-# ── Gemini CLI  (PM/PO Agent: nexus-pm-XX) — OAuth 登录，无 API key ─
+# ── Gemini CLI  (可选) — 仅在某些 Agent 显式走 gemini 路线时需要 ───────
 # 先执行：gemini auth login
 GEMINI_CLI_CMD     = ["gemini"]      # CLI 路径，如 ["/usr/local/bin/gemini"]
 GEMINI_PROMPT_FLAG = "-p"            # 传 prompt 的 flag；用 stdin 则设为 None

@@ -50,6 +50,7 @@ def test_orchestrator_records_laziness_signals(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(executor, "git_create_branch", fake_git_create_branch)
     monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
+    monkeypatch.setattr(executor, "git_changed_files", lambda limit=8: asyncio.sleep(0, result=[]))
     orchestrator = Orchestrator(
         registry,
         Router(registry),

@@ -2,6 +2,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+import urllib.error
 
 from nexuscrew.artifacts import ArtifactRecord, ArtifactStore
 from nexuscrew.git.ci import CIResult
@@ -17,6 +18,7 @@ from nexuscrew.runtime.stuck import StuckDetector
 from nexuscrew.runtime.store import EventStore
 from nexuscrew.skills.registry import SkillRegistry
 from nexuscrew.telegram.bot import NexusCrewBot
+from nexuscrew.policy.access import AccessController
 from nexuscrew.metrics import AgentMetrics
 from nexuscrew.hr.metrics_store import MetricsStore
 
@@ -40,6 +42,29 @@ def test_branch_session_store_and_pr_draft(tmp_path: Path):
     assert store.get(1, "T-0001").branch_name == "feat/t-0001-demo"
     assert "Summary" in draft.body
     assert draft.head == "feat/t-0001-demo"
+
+
+def test_pr_workflow_returns_draft_on_network_error():
+    workflow = PRWorkflow(repo="owner/repo", token="token")
+
+    class Task:
+        id = "T-0001"
+        description = "实现缓存"
+        github_issue_url = ""
+        github_pr_number = 0
+        github_pr_url = ""
+
+    session = BranchSession(chat_id=1, task_id="T-0001", branch_name="feat/t-0001-demo", base_branch="main")
+
+    def fail_create(draft):
+        raise urllib.error.URLError("handshake timeout")
+
+    workflow._create_pull_request = fail_create
+
+    draft = asyncio.run(workflow.ensure_pr(Task(), session, "完成缓存层", "pytest passed"))
+
+    assert draft.number == 0
+    assert draft.url == ""
 
 
 def test_merge_gate_and_artifact_store(tmp_path: Path):
@@ -113,6 +138,8 @@ def test_hr_analytics_reports(tmp_path: Path):
 
 def test_skill_registry_and_bot_commands():
     bot = NexusCrewBot()
+    bot._allowed = set()
+    bot._access = AccessController()
     replies: list[str] = []
     bot._orch = SimpleNamespace(
         task_tracker=SimpleNamespace(
@@ -143,6 +170,8 @@ def test_skill_registry_and_bot_commands():
 
 def test_trace_artifacts_pr_ci_and_board_commands():
     bot = NexusCrewBot()
+    bot._allowed = set()
+    bot._access = AccessController()
     replies: list[str] = []
     bot._orch = SimpleNamespace(
         trace_summary=lambda task_id: f"trace:{task_id}",

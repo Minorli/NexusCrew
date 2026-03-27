@@ -28,3 +28,6 @@ metrics_history.jsonl
 .nexus_audit.jsonl
 .nexuscrew_state.db
 .nexus_launch.json
+
+local_secrets.py
+.env.*

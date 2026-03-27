@@ -1,5 +1,6 @@
 """Configuration loader — reads crew.yaml and returns structured config."""
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 import yaml
@@ -26,11 +27,16 @@ class OrchestratorConfig:
     history_window: int = 20
     memory_tail_lines: int = 120
     shell_timeout: int = 120
+    agent_heartbeat_seconds: int = 20
+    agent_max_silence_seconds: int = 120
+    task_stage_sla_seconds: int = 600
+    task_watchdog_interval_seconds: int = 60
 
 
 @dataclass
 class HRConfig:
     eval_per_task: bool = True
+    auto_eval_daily_limit: int = 1
     summary_interval: int = 5
     pressure_cooldown: int = 2
     pressure_max_prompt_len: int = 500
@@ -125,3 +131,10 @@ def load_crew_config(path: str | Path) -> CrewConfig:
         )),
         hr=_load_hr_config(hr_raw),
     )
+
+
+def _read_secret_from_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise EnvironmentError(f"Missing required environment variable: {name}")
+    return value

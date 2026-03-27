@@ -56,6 +56,10 @@ class Task:
             return True
         return False
 
+    def last_activity_at(self) -> datetime:
+        stamp = self.updated_at or self.created_at
+        return datetime.fromisoformat(stamp)
+
 
 class TaskTracker:
     """Track all tasks per chat."""
@@ -92,6 +96,13 @@ class TaskTracker:
 
     def latest_active(self, chat_id: int) -> Task | None:
         tasks = self.list_active(chat_id)
+        return tasks[-1] if tasks else None
+
+    def latest_active_for_assignee(self, chat_id: int, assignee: str) -> Task | None:
+        tasks = [
+            task for task in self.list_active(chat_id)
+            if task.assigned_to == assignee
+        ]
         return tasks[-1] if tasks else None
 
     def format_status(self, chat_id: int) -> str:

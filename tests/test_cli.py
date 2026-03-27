@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from nexuscrew import cli
 
 
-def test_cli_defaults_to_start(monkeypatch):
+def test_cli_defaults_to_start(monkeypatch, tmp_path: Path):
     seen: dict[str, object] = {}
 
     class FakeApp:
@@ -24,6 +24,7 @@ def test_cli_defaults_to_start(monkeypatch):
     monkeypatch.setattr(cli, "NexusCrewBot", FakeBot)
     monkeypatch.setattr(cli, "load_crew_config", lambda path: {"path": path})
     monkeypatch.setattr(cli, "load_local_secrets", lambda: SimpleNamespace(TELEGRAM_BOT_TOKEN="test-token"))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["nexuscrew"])
     monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
 
@@ -65,7 +66,7 @@ def test_cli_starts_setup_wizard_when_secret_missing(monkeypatch):
     seen: dict[str, object] = {}
 
     class FakeWizard:
-        def __init__(self, base_dir, host="127.0.0.1", port=8766):
+        def __init__(self, base_dir, host="0.0.0.0", port=8766):
             seen["base_dir"] = base_dir
             seen["host"] = host
             seen["port"] = port
@@ -81,6 +82,7 @@ def test_cli_starts_setup_wizard_when_secret_missing(monkeypatch):
     cli.main()
 
     assert seen["served"] is True
+    assert seen["host"] == "0.0.0.0"
 
 
 def test_cli_autoloads_crew_local_yaml(monkeypatch, tmp_path: Path):
@@ -116,7 +118,7 @@ def test_cli_setup_command_starts_wizard(monkeypatch):
     seen: dict[str, object] = {}
 
     class FakeWizard:
-        def __init__(self, base_dir, host="127.0.0.1", port=8766):
+        def __init__(self, base_dir, host="0.0.0.0", port=8766):
             seen["base_dir"] = base_dir
             seen["host"] = host
             seen["port"] = port
@@ -133,3 +135,10 @@ def test_cli_setup_command_starts_wizard(monkeypatch):
     assert seen["host"] == "0.0.0.0"
     assert seen["port"] == 9000
     assert seen["served"] is True
+
+
+def test_cli_formats_setup_urls(monkeypatch):
+    monkeypatch.setattr(cli, "_discover_bind_addresses", lambda host: ["127.0.0.1", "172.16.0.128"])
+    urls = cli._format_setup_urls("0.0.0.0", 8766)
+    assert "http://127.0.0.1:8766/setup" in urls
+    assert "http://172.16.0.128:8766/setup" in urls

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from nexuscrew.config import load_crew_config
+from nexuscrew.telegram import bot as bot_module
 from nexuscrew.telegram.bot import NexusCrewBot
 
 
@@ -28,6 +29,27 @@ def test_load_crew_config_requires_project_dir(tmp_path: Path):
         load_crew_config(path)
 
 
+def test_make_backend_uses_global_model_fallbacks(monkeypatch):
+    monkeypatch.setattr(bot_module.cfg, "OPENAI_API_KEY", "sk-test", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "OPENAI_BASE_URL", "https://example.com/v1", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "OPENAI_MODEL", "gpt-5.4", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_API_KEY", "sk-ant-test", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_BASE_URL", "https://anth.example.com/", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_MODEL", "claude-opus-4-6", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6", raising=False)
+
+    codex_backend = bot_module._make_backend("codex", None, {"openai_model": None})
+    claude_backend = bot_module._make_backend(
+        "claude",
+        None,
+        {"anthropic_model": None, "anthropic_model_light": None},
+    )
+
+    assert codex_backend.model == "gpt-5.4"
+    assert claude_backend.model == "claude-opus-4-6"
+    assert claude_backend.model_light == "claude-sonnet-4-6"
+
+
 @pytest.mark.asyncio
 async def test_cmd_load_uses_shared_initializer(tmp_path: Path, monkeypatch):
     crew_file = tmp_path / "crew.yaml"
@@ -43,6 +65,7 @@ async def test_cmd_load_uses_shared_initializer(tmp_path: Path, monkeypatch):
     )
 
     bot = NexusCrewBot()
+    bot._allowed = set()
     seen: dict[str, object] = {}
 
     async def fake_init(config, update):
@@ -72,6 +95,7 @@ async def test_cmd_load_uses_shared_initializer(tmp_path: Path, monkeypatch):
 @pytest.mark.asyncio
 async def test_cmd_load_requires_path_argument():
     bot = NexusCrewBot()
+    bot._allowed = set()
     replies: list[str] = []
 
     class FakeMessage:

@@ -1,6 +1,7 @@
-"""PM Agent — backed by Gemini CLI."""
+"""PM Agent — backed by Claude or Gemini."""
 import asyncio
 from .base import BaseAgent, AgentArtifacts
+from ..backends.anthropic_backend import AnthropicBackend
 from ..backends.gemini_cli import GeminiCLIBackend
 
 PM_PROMPT = """\
@@ -19,26 +20,40 @@ PM_PROMPT = """\
 【输出规范】
 - 任务清单格式：[P0/P1/P2] 任务描述 → @负责人
 - 每次发言末尾必须明确 @下一个接手角色。
+- 如果 Human 问的是“进度 / 状态 / 在吗 / 看看成员状态 / 有没有更新”这类状态问题，默认由你自己汇总回答，不要再 @ 全员拉一轮状态。
 - 重要产品决策或架构约定，在回复末尾加【MEMORY】标记持久化。"""
 
 
 class PMAgent(BaseAgent):
-    def __init__(self, name: str, backend: GeminiCLIBackend,
-                 system_prompt_extra: str = ""):
-        super().__init__(name, "pm", "gemini", system_prompt_extra)
+    def __init__(
+        self,
+        name: str,
+        backend: AnthropicBackend | GeminiCLIBackend,
+        system_prompt_extra: str = "",
+        model_label: str = "claude",
+    ):
+        super().__init__(name, "pm", model_label, system_prompt_extra)
         self.backend = backend
 
     async def handle(
         self, message: str, history: list[dict], crew_memory: str
     ) -> tuple[str, AgentArtifacts]:
         system = self._build_system(PM_PROMPT, crew_memory)
-        # Gemini CLI is text-in/text-out; we pass full context as one prompt
-        history_text = "\n".join(
-            f"[{m.get('agent','?')}]: {m['content'][:400]}"
-            for m in history[-8:]
-        )
-        prompt = f"{system}\n\n【近期对话】\n{history_text}\n\n【当前消息】\n{message}"
-        reply = await asyncio.to_thread(self.backend.complete, prompt)
+        if self.model_label == "claude":
+            messages = []
+            for item in history[-8:]:
+                role = "assistant" if item.get("agent") == self.name else "user"
+                messages.append({"role": role, "content": item["content"][:800]})
+            messages.append({"role": "user", "content": message})
+            reply = await asyncio.to_thread(self.backend.complete, system, messages)
+        else:
+            # Gemini CLI is text-in/text-out; we pass full context as one prompt.
+            history_text = "\n".join(
+                f"[{m.get('agent','?')}]: {m['content'][:400]}"
+                for m in history[-8:]
+            )
+            prompt = f"{system}\n\n【近期对话】\n{history_text}\n\n【当前消息】\n{message}"
+            reply = await asyncio.to_thread(self.backend.complete, prompt)
         artifacts = AgentArtifacts()
         if "【MEMORY】" in reply:
             reply, artifacts.memory_note = reply.split("【MEMORY】", 1)

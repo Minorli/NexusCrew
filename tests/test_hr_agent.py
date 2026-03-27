@@ -21,6 +21,17 @@ class FakeGeminiBackend:
         return self.reply
 
 
+class FakeAnthropicBackend:
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.calls: list[tuple[str, list[dict]]] = []
+
+    def complete(self, system: str, messages: list[dict], use_thinking: bool = False,
+                 light_mode: bool = False) -> str:
+        self.calls.append((system, messages))
+        return self.reply
+
+
 async def _direct_to_thread(func, *args, **kwargs):
     return func(*args, **kwargs)
 
@@ -28,13 +39,27 @@ async def _direct_to_thread(func, *args, **kwargs):
 def test_hr_agent_extracts_memory_note(monkeypatch):
     monkeypatch.setattr(hr_module.asyncio, "to_thread", _direct_to_thread)
     backend = FakeGeminiBackend("绩效正常【MEMORY】保留亮点")
-    agent = HRAgent("carol", backend)
+    agent = HRAgent("carol", backend, model_label="gemini")
 
     reply, artifacts = asyncio.run(agent.handle("出绩效报告", [], "memory"))
 
     assert reply == "绩效正常"
     assert artifacts.memory_note == "保留亮点"
     assert "出绩效报告" in backend.prompts[0]
+
+
+def test_hr_agent_supports_anthropic_backend(monkeypatch):
+    monkeypatch.setattr(hr_module.asyncio, "to_thread", _direct_to_thread)
+    backend = FakeAnthropicBackend("绩效正常【MEMORY】保留亮点")
+    agent = HRAgent("carol", backend, model_label="claude")
+
+    reply, artifacts = asyncio.run(agent.handle("出绩效报告", [], "memory"))
+
+    assert reply == "绩效正常"
+    assert artifacts.memory_note == "保留亮点"
+    assert "技术型管理 HR" in backend.calls[0][0]
+    assert backend.calls[0][1][-1]["content"] == "出绩效报告"
+    assert agent.model_label == "claude"
 
 
 def test_init_from_config_registers_hr_agent(tmp_path: Path, monkeypatch):
@@ -46,6 +71,7 @@ def test_init_from_config_registers_hr_agent(tmp_path: Path, monkeypatch):
     project_dir.mkdir()
 
     bot = NexusCrewBot()
+    bot._allowed = set()
 
     async def fake_scan(project):
         return "brief"
@@ -64,7 +90,7 @@ def test_init_from_config_registers_hr_agent(tmp_path: Path, monkeypatch):
     update = type("Update", (), {"message": FakeMessage()})()
     config = CrewConfig(
         project_dir=project_dir,
-        agents=[AgentSpec(role="hr", name="carol", model="gemini")],
+        agents=[AgentSpec(role="hr", name="carol", model="claude")],
     )
 
     asyncio.run(bot._init_from_config(config, update))
@@ -75,7 +101,7 @@ def test_init_from_config_registers_hr_agent(tmp_path: Path, monkeypatch):
 def test_orchestrator_persists_hr_memory_note(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(hr_module.asyncio, "to_thread", _direct_to_thread)
     registry = AgentRegistry()
-    registry.register(HRAgent("carol", FakeGeminiBackend("报告【MEMORY】写入记忆")))
+    registry.register(HRAgent("carol", FakeGeminiBackend("报告【MEMORY】写入记忆"), model_label="gemini"))
     memory = CrewMemory(tmp_path / "crew_memory.md")
     orchestrator = Orchestrator(
         registry,

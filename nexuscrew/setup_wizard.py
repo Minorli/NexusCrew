@@ -51,19 +51,74 @@ def _parse_agent_specs(specs_text: str) -> list[dict]:
 
 def _default_model(role: str) -> str:
     return {
-        "pm": "gemini",
+        "pm": "claude",
         "dev": "codex",
         "architect": "claude",
-        "hr": "gemini",
-    }.get(role, "gemini")
+        "hr": "claude",
+    }.get(role, "claude")
+
+
+def _uses_gemini(form: dict[str, str]) -> bool:
+    try:
+        specs = _parse_agent_specs(form.get("agent_specs", "").strip())
+    except Exception:
+        return False
+    return any(spec.get("model") == "gemini" for spec in specs)
+
+
+def _parse_agent_bot_specs(specs_text: str) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Parse lines like:
+      nexus-pm-01|123456:ABCDEF|nexus_pm_01_bot
+      nexus-dev-01|123456:UVWXYZ|nexus_dev_01_bot
+    Returns (agent_bot_tokens, bot_username_map)
+    """
+    tokens: dict[str, str] = {}
+    usernames: dict[str, str] = {}
+    for raw_line in specs_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 2:
+            raise ValueError(f"无法解析 agent bot spec: {line}")
+        agent_name = parts[0]
+        bot_token = parts[1]
+        bot_username = parts[2] if len(parts) >= 3 else ""
+        if not agent_name:
+            raise ValueError(f"agent bot spec 缺少 agent 名称: {line}")
+        if not bot_token:
+            raise ValueError(f"agent bot spec 缺少 bot token: {line}")
+        tokens[agent_name] = bot_token
+        if bot_username:
+            usernames[bot_username] = agent_name
+    return tokens, usernames
+
+
+def _collect_agent_bot_specs(form: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    raw_specs = form.get("agent_bot_specs", "").strip()
+    rows: list[str] = []
+    for idx in range(1, 9):
+        agent_name = form.get(f"agent_bot_name_{idx}", "").strip()
+        bot_token = form.get(f"agent_bot_token_{idx}", "").strip()
+        bot_username = form.get(f"agent_bot_username_{idx}", "").strip()
+        if not any((agent_name, bot_token, bot_username)):
+            continue
+        rows.append("|".join([agent_name, bot_token, bot_username]))
+    if rows:
+        raw_specs = "\n".join(rows + ([raw_specs] if raw_specs else []))
+    if not raw_specs:
+        return {}, {}
+    return _parse_agent_bot_specs(raw_specs)
 
 
 def build_secrets_py(form: dict[str, str]) -> str:
+    agent_bot_tokens, bot_username_map = _collect_agent_bot_specs(form)
     payload = {
         "TELEGRAM_BOT_TOKEN": form.get("telegram_bot_token", ""),
         "TELEGRAM_ALLOWED_CHAT_IDS": _csv_ints(form.get("telegram_allowed_chat_ids", "")),
-        "AGENT_BOT_TOKENS": {},
-        "BOT_USERNAME_MAP": {},
+        "AGENT_BOT_TOKENS": agent_bot_tokens,
+        "BOT_USERNAME_MAP": bot_username_map,
         "OPENAI_API_KEY": form.get("openai_api_key", ""),
         "OPENAI_BASE_URL": form.get("openai_base_url", "https://api.openai.com/v1"),
         "OPENAI_MODEL": form.get("openai_model", "gpt-4.5"),
@@ -137,6 +192,7 @@ def build_crew_local_yaml(form: dict[str, str]) -> str | None:
         },
         "hr": {
             "eval_per_task": True,
+            "auto_eval_daily_limit": 1,
             "summary_interval": 5,
             "pressure_cooldown": 2,
             "pressure_max_prompt_len": 500,
@@ -170,6 +226,10 @@ def validate_setup(form: dict[str, str], base_dir: Path) -> list[str]:
         _parse_agent_specs(form.get("agent_specs", "").strip())
     except Exception as err:
         issues.append(str(err))
+    try:
+        _collect_agent_bot_specs(form)
+    except Exception as err:
+        issues.append(str(err))
     for key in (
         "github_webhook_port",
         "slack_commands_port",
@@ -190,8 +250,8 @@ def validate_setup(form: dict[str, str], base_dir: Path) -> list[str]:
         _csv_ints(form.get("telegram_admin_user_ids", ""))
     except ValueError as err:
         issues.append(f"ID 列表解析失败: {err}")
-    gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini")) or ["gemini"]
-    if not gemini_cmd[0]:
+    gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini"))
+    if _uses_gemini(form) and not gemini_cmd:
         issues.append("GEMINI_CLI_CMD 不能为空")
     return issues
 
@@ -235,12 +295,14 @@ def run_live_checks(form: dict[str, str], base_dir: Path) -> list[dict]:
             "detail": str(path),
         })
 
-    gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini")) or ["gemini"]
-    checks.append({
-        "title": "Gemini CLI",
-        "ok": which(gemini_cmd[0]) is not None,
-        "detail": gemini_cmd[0],
-    })
+    gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini"))
+    if _uses_gemini(form):
+        command = gemini_cmd[0] if gemini_cmd else ""
+        checks.append({
+            "title": "Gemini CLI",
+            "ok": bool(command) and which(command) is not None,
+            "detail": command or "未填写命令",
+        })
 
     github_repo = form.get("github_repo", "").strip()
     github_token = form.get("github_token", "").strip()
@@ -298,10 +360,14 @@ def run_setup_checks(form: dict[str, str], base_dir: Path) -> list[str]:
         checks.append(
             f"Project Dir: {'存在' if Path(project_dir).expanduser().exists() else '不存在'}"
         )
-    gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini")) or ["gemini"]
-    checks.append(
-        f"Gemini CLI: {'可执行' if which(gemini_cmd[0]) else '未在 PATH 中找到'}"
-    )
+    if _uses_gemini(form):
+        gemini_cmd = _csv_strs(form.get("gemini_cli_cmd", "gemini"))
+        command = gemini_cmd[0] if gemini_cmd else ""
+        checks.append(
+            f"Gemini CLI: {'可执行' if command and which(command) else '未在 PATH 中找到'}"
+        )
+    else:
+        checks.append("Gemini CLI: 当前编组未启用")
     github_repo = form.get("github_repo", "").strip()
     if github_repo:
         checks.append(
@@ -325,6 +391,10 @@ def read_setup_defaults(base_dir: Path) -> dict[str, str]:
     defaults = {
         "telegram_bot_token": getattr(cfg, "TELEGRAM_BOT_TOKEN", ""),
         "telegram_allowed_chat_ids": ",".join(map(str, getattr(cfg, "TELEGRAM_ALLOWED_CHAT_IDS", []))),
+        "agent_bot_specs": "\n".join(
+            f"{agent_name}|{token}|{next((username for username, mapped in getattr(cfg, 'BOT_USERNAME_MAP', {}).items() if mapped == agent_name), '')}"
+            for agent_name, token in getattr(cfg, "AGENT_BOT_TOKENS", {}).items()
+        ),
         "openai_api_key": getattr(cfg, "OPENAI_API_KEY", ""),
         "openai_base_url": getattr(cfg, "OPENAI_BASE_URL", "https://api.openai.com/v1"),
         "openai_model": getattr(cfg, "OPENAI_MODEL", "gpt-4.5"),
@@ -335,11 +405,38 @@ def read_setup_defaults(base_dir: Path) -> dict[str, str]:
         "gemini_cli_cmd": ",".join(getattr(cfg, "GEMINI_CLI_CMD", ["gemini"])),
         "gemini_prompt_flag": getattr(cfg, "GEMINI_PROMPT_FLAG", "-p") or "",
         "gemini_model": getattr(cfg, "GEMINI_MODEL", "gemini-2.5-pro"),
+        "workspace_dir": getattr(cfg, "WORKSPACE_DIR", "."),
+        "github_sync_enabled": "1" if getattr(cfg, "GITHUB_SYNC_ENABLED", False) else "",
         "github_token": getattr(cfg, "GITHUB_TOKEN", ""),
         "github_repo": getattr(cfg, "GITHUB_REPO", ""),
         "github_issue_labels": ",".join(getattr(cfg, "GITHUB_ISSUE_LABELS", ["nexuscrew", "task-log"])),
+        "github_api_url": getattr(cfg, "GITHUB_API_URL", "https://api.github.com"),
+        "github_issue_title_prefix": getattr(cfg, "GITHUB_ISSUE_TITLE_PREFIX", "NexusCrew"),
+        "github_webhook_enabled": "1" if getattr(cfg, "GITHUB_WEBHOOK_ENABLED", False) else "",
+        "github_webhook_host": getattr(cfg, "GITHUB_WEBHOOK_HOST", "127.0.0.1"),
+        "github_webhook_port": str(getattr(cfg, "GITHUB_WEBHOOK_PORT", 8788)),
+        "github_webhook_secret": getattr(cfg, "GITHUB_WEBHOOK_SECRET", ""),
+        "slack_sync_enabled": "1" if getattr(cfg, "SLACK_SYNC_ENABLED", False) else "",
         "slack_bot_token": getattr(cfg, "SLACK_BOT_TOKEN", ""),
         "slack_default_channel": getattr(cfg, "SLACK_DEFAULT_CHANNEL", ""),
+        "slack_api_url": getattr(cfg, "SLACK_API_URL", "https://slack.com/api"),
+        "slack_title_prefix": getattr(cfg, "SLACK_TITLE_PREFIX", "NexusCrew"),
+        "slack_commands_enabled": "1" if getattr(cfg, "SLACK_COMMANDS_ENABLED", False) else "",
+        "slack_commands_host": getattr(cfg, "SLACK_COMMANDS_HOST", "127.0.0.1"),
+        "slack_commands_port": str(getattr(cfg, "SLACK_COMMANDS_PORT", 8789)),
+        "slack_signing_secret": getattr(cfg, "SLACK_SIGNING_SECRET", ""),
+        "slack_app_home_enabled": "1" if getattr(cfg, "SLACK_APP_HOME_ENABLED", False) else "",
+        "slack_app_home_user_ids": ",".join(getattr(cfg, "SLACK_APP_HOME_USER_IDS", [])),
+        "slack_app_home_refresh_seconds": str(getattr(cfg, "SLACK_APP_HOME_REFRESH_SECONDS", 0)),
+        "slack_default_chat_id": str(getattr(cfg, "SLACK_DEFAULT_CHAT_ID", 0)),
+        "telegram_operator_user_ids": ",".join(map(str, getattr(cfg, "TELEGRAM_OPERATOR_USER_IDS", []))),
+        "telegram_approver_user_ids": ",".join(map(str, getattr(cfg, "TELEGRAM_APPROVER_USER_IDS", []))),
+        "telegram_admin_user_ids": ",".join(map(str, getattr(cfg, "TELEGRAM_ADMIN_USER_IDS", []))),
+        "dashboard_enabled": "1" if getattr(cfg, "DASHBOARD_ENABLED", False) else "",
+        "dashboard_host": getattr(cfg, "DASHBOARD_HOST", "127.0.0.1"),
+        "dashboard_port": str(getattr(cfg, "DASHBOARD_PORT", 8787)),
+        "auto_recover_background_runs": "1" if getattr(cfg, "AUTO_RECOVER_BACKGROUND_RUNS", False) else "",
+        "system_notification_chat_id": str(getattr(cfg, "SYSTEM_NOTIFICATION_CHAT_ID", 0)),
     }
     crew_local = base_dir / "crew.local.yaml"
     if crew_local.exists():
@@ -349,6 +446,21 @@ def read_setup_defaults(base_dir: Path) -> dict[str, str]:
         defaults["agent_specs"] = "\n".join(
             f"{agent.get('role')}:{agent.get('name')}({agent.get('model')})"
             for agent in raw.get("agents", [])
+        )
+        orch = raw.get("orchestrator", {})
+        defaults["max_chain_hops"] = str(orch.get("max_chain_hops", 10))
+        defaults["max_dev_retry"] = str(orch.get("max_dev_retry", 5))
+        defaults["history_window"] = str(orch.get("history_window", 20))
+        defaults["memory_tail_lines"] = str(orch.get("memory_tail_lines", 120))
+        defaults["shell_timeout"] = str(orch.get("shell_timeout", 120))
+    rows = list(getattr(cfg, "AGENT_BOT_TOKENS", {}).items())
+    username_map = getattr(cfg, "BOT_USERNAME_MAP", {})
+    for idx, (agent_name, token) in enumerate(rows[:8], start=1):
+        defaults[f"agent_bot_name_{idx}"] = agent_name
+        defaults[f"agent_bot_token_{idx}"] = token
+        defaults[f"agent_bot_username_{idx}"] = next(
+            (username for username, mapped in username_map.items() if mapped == agent_name),
+            "",
         )
     return defaults
 
@@ -435,6 +547,7 @@ def render_success_html(
         <div class="card">
           <h2>下一步</h2>
           <ul>
+            <li><a href="/console">打开本地控制台</a></li>
             <li>如需重新配置，重新访问 <code>/setup</code></li>
             <li>如使用 Telegram，确认 bot 已加入目标群组</li>
             <li>如启用 GitHub / Slack，同步检查 token 与权限</li>
@@ -484,6 +597,68 @@ def build_launch_report(base_dir: Path, pid: int | None = None) -> list[str]:
     ]
 
 
+def render_console_html(base_dir: Path) -> str:
+    saved_files = build_saved_files_summary(base_dir)
+    launch_report = build_launch_report(base_dir)
+    saved_list = "".join(f"<li><code>{html.escape(path)}</code></li>" for path in saved_files) or "<li>(无)</li>"
+    launch_list = "".join(f"<li>{html.escape(line)}</li>" for line in launch_report)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NexusCrew Console</title>
+  <style>
+    :root {{
+      --bg: #0d1321;
+      --panel: #111827;
+      --line: #263043;
+      --text: #e5ecf4;
+      --muted: #9fb2c8;
+      --accent: #7dd3fc;
+      --accent2: #a7f3d0;
+    }}
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top, #16213b, var(--bg)); color: var(--text); }}
+    .wrap {{ max-width: 980px; margin: 48px auto; padding: 0 20px; }}
+    .hero {{ background: color-mix(in srgb, var(--panel) 92%, black); border: 1px solid var(--line); border-radius: 24px; padding: 28px; box-shadow: 0 20px 80px rgba(0,0,0,.25); }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 24px; }}
+    .card {{ border-radius: 18px; padding: 18px; border: 1px solid var(--line); background: rgba(255,255,255,.03); }}
+    h1 {{ margin: 0 0 8px; font-size: 36px; }}
+    h2 {{ margin: 0 0 8px; font-size: 20px; }}
+    p, li {{ color: var(--muted); }}
+    code {{ color: var(--accent2); }}
+    a {{ color: var(--accent); }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>NexusCrew Local Console</h1>
+      <p>这是本地 setup/onboarding 的控制台页，用于查看当前生成文件、启动状态和下一步操作。</p>
+      <div class="grid">
+        <div class="card">
+          <h2>运行状态</h2>
+          <ul>{launch_list}</ul>
+        </div>
+        <div class="card">
+          <h2>本地文件</h2>
+          <ul>{saved_list}</ul>
+        </div>
+        <div class="card">
+          <h2>下一步</h2>
+          <ul>
+            <li><a href="/setup">重新打开向导</a></li>
+            <li>在 Telegram 里执行 <code>/status</code> 或 <code>/doctor</code></li>
+            <li>如果未运行，可在终端执行 <code>python3 -m nexuscrew</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 def render_setup_html(message: str = "", launch_ready: bool = False,
                       defaults: dict[str, str] | None = None,
                       checks: list[str] | None = None,
@@ -499,6 +674,44 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
 
     def checked(name: str) -> str:
         return "checked" if _truthy(defaults.get(name)) else ""
+
+    def bot_rows() -> str:
+        rows = []
+        placeholders = [
+            "PM",
+            "Dev 1",
+            "Dev 2",
+            "Architect",
+            "HR",
+            "Extra 1",
+            "Extra 2",
+            "Extra 3",
+        ]
+        for idx, label in enumerate(placeholders, start=1):
+            rows.append(
+                f"""
+                <div class="bot-row">
+                  <div class="field"><label>{label} Agent Name</label><input name="agent_bot_name_{idx}" value="{val(f'agent_bot_name_{idx}')}" placeholder="nexus-dev-01"></div>
+                  <div class="field"><label>{label} Bot Token</label><input name="agent_bot_token_{idx}" value="{val(f'agent_bot_token_{idx}')}" placeholder="123456:ABC"></div>
+                  <div class="field"><label>{label} Bot Username</label><input name="agent_bot_username_{idx}" value="{val(f'agent_bot_username_{idx}')}" placeholder="nexus_dev_01_bot"></div>
+                </div>
+                """
+            )
+        return "".join(rows)
+
+    def check_cards() -> str:
+        if not checks:
+            return ""
+        cards = []
+        for item in checks:
+            ok = ("有效" in item) or ("通过" in item) or ("存在" in item) or ("可执行" in item) or ("已解析" in item) or ("运行中" in item)
+            cards.append(
+                f"<div class='check-card {'ok' if ok else 'bad'}'><div>{html.escape(item)}</div></div>"
+            )
+        return (
+            "<div class='checks'><strong>" + html.escape(checks_heading) + "</strong>"
+            + "<div class='check-card-grid'>" + "".join(cards) + "</div></div>"
+        )
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -531,7 +744,10 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
     .secondary {{ border: 1px solid var(--line); border-radius: 999px; padding: 14px 22px; background: transparent; color: var(--text); font-weight: 700; cursor: pointer; }}
     .banner {{ margin-bottom: 16px; padding: 14px 16px; border-radius: 14px; background: rgba(125,211,252,.12); border: 1px solid rgba(125,211,252,.24); color: var(--text); }}
     .checks {{ margin-top: 18px; padding: 14px 16px; border-radius: 14px; background: rgba(167,243,208,.08); border: 1px solid rgba(167,243,208,.24); }}
-    .checks ul {{ margin: 8px 0 0; padding-left: 20px; }}
+    .check-card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 10px; }}
+    .check-card {{ border-radius: 14px; padding: 14px; border: 1px solid var(--line); background: rgba(255,255,255,.03); color: var(--text); }}
+    .check-card.ok {{ border-color: rgba(167,243,208,.35); background: rgba(167,243,208,.07); }}
+    .check-card.bad {{ border-color: rgba(248,113,113,.35); background: rgba(248,113,113,.08); }}
     .launch {{ margin-top: 18px; padding: 14px 16px; border-radius: 14px; background: rgba(125,211,252,.09); border: 1px solid rgba(125,211,252,.28); }}
     .launch ul {{ margin: 8px 0 0; padding-left: 20px; }}
     .wizard {{ display: grid; grid-template-columns: 240px 1fr; gap: 22px; }}
@@ -542,6 +758,8 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
     .wizard-step.active {{ display: block; }}
     .footer-nav {{ display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; }}
     .meta {{ font-size: 13px; color: var(--muted); }}
+    .bot-row {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }}
+    details.summary-box {{ margin-top: 16px; border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }}
     code {{ color: var(--accent2); }}
   </style>
 </head>
@@ -571,6 +789,12 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
                 <div class="field"><label>Admin User IDs</label><input name="telegram_admin_user_ids" value="{val('telegram_admin_user_ids')}" placeholder="12345,67890"></div>
                 <div class="field"><label>System Notification Chat ID</label><input name="system_notification_chat_id" value="{val('system_notification_chat_id', '0')}"></div>
               </div>
+              <details class="summary-box" open>
+                <summary>Dedicated Agent Bots</summary>
+                <p class="meta">给需要独立 Telegram 身份的 Agent 填写专属 bot token 和 username 映射。可以只填一部分，没填的 Agent 会走 Dispatcher fallback。</p>
+                {bot_rows()}
+                <div class="field"><label>Advanced Raw Spec Override</label><textarea name="agent_bot_specs" placeholder="nexus-pm-01|123456:AAA|nexus_pm_01_bot&#10;nexus-dev-01|123456:BBB|nexus_dev_01_bot">{html.escape(defaults.get('agent_bot_specs', ''))}</textarea></div>
+              </details>
               <div class="footer-nav"><button class="secondary" type="button" data-next-step>下一步</button></div>
             </section>
 
@@ -584,9 +808,9 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
                 <div class="field"><label>Anthropic Base URL</label><input name="anthropic_base_url" value="{val('anthropic_base_url', 'https://api.anthropic.com')}"></div>
                 <div class="field"><label>Anthropic Opus Model</label><input name="anthropic_model_opus" value="{val('anthropic_model_opus', 'claude-opus-4-6')}"></div>
                 <div class="field"><label>Anthropic Sonnet Model</label><input name="anthropic_model_sonnet" value="{val('anthropic_model_sonnet', 'claude-sonnet-4-6')}"></div>
-                <div class="field"><label>Gemini CLI Command (comma-separated)</label><input name="gemini_cli_cmd" value="{val('gemini_cli_cmd', 'gemini')}"></div>
-                <div class="field"><label>Gemini Prompt Flag</label><input name="gemini_prompt_flag" value="{val('gemini_prompt_flag', '-p')}"></div>
-                <div class="field"><label>Gemini Model</label><input name="gemini_model" value="{val('gemini_model', 'gemini-2.5-pro')}"></div>
+                <div class="field"><label>Optional Gemini CLI Command (comma-separated)</label><input name="gemini_cli_cmd" value="{val('gemini_cli_cmd', 'gemini')}"></div>
+                <div class="field"><label>Optional Gemini Prompt Flag</label><input name="gemini_prompt_flag" value="{val('gemini_prompt_flag', '-p')}"></div>
+                <div class="field"><label>Optional Gemini Model</label><input name="gemini_model" value="{val('gemini_model', 'gemini-2.5-pro')}"></div>
               </div>
               <div class="footer-nav"><button class="secondary" type="button" data-prev-step>上一步</button><button class="secondary" type="button" data-next-step>下一步</button></div>
             </section>
@@ -612,7 +836,7 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
               <div class="grid">
                 <div class="field"><label>Project Directory</label><input name="project_dir" value="{val('project_dir')}" placeholder="~/myproject"></div>
                 <div class="field"><label>Project Prefix</label><input name="project_prefix" value="{val('project_prefix', 'nexus')}"></div>
-                <div class="field"><label>Agent Specs</label><textarea name="agent_specs">{html.escape(defaults.get('agent_specs', 'pm:nexus-pm-01(gemini)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(gemini)'))}</textarea></div>
+                <div class="field"><label>Agent Specs</label><textarea name="agent_specs">{html.escape(defaults.get('agent_specs', 'pm:nexus-pm-01(claude)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(claude)'))}</textarea></div>
                 <div class="field"><label>Max Chain Hops</label><input name="max_chain_hops" value="{val('max_chain_hops', '10')}"></div>
                 <div class="field"><label>Max Dev Retry</label><input name="max_dev_retry" value="{val('max_dev_retry', '5')}"></div>
                 <div class="field"><label>History Window</label><input name="history_window" value="{val('history_window', '20')}"></div>
@@ -632,7 +856,7 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
                 {"<button class='secondary' type='submit' formaction='/save-and-launch'>保存并启动</button>" if launch_ready else ""}
                 <span>保存后不会提交到 GitHub；配置只保存在本地。</span>
               </div>
-              {("<div class='checks'><strong>" + html.escape(checks_heading) + "</strong><ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in checks) + "</ul></div>") if checks else ""}
+              {check_cards()}
               {("<div class='launch'><strong>运行状态</strong><ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in launch_report) + "</ul></div>") if launch_report else ""}
               <div class="footer-nav"><button class="secondary" type="button" data-prev-step>上一步</button></div>
             </section>
@@ -678,6 +902,14 @@ class SetupWizardServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path == "/console":
+                    payload = render_console_html(base_dir).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if self.path not in ("/", "/setup"):
                     self.send_response(404)
                     self.end_headers()
@@ -727,18 +959,24 @@ class SetupWizardServer:
                         save_setup(form, base_dir)
                         launch_note = ""
                         launch_report = []
+                        title = "配置已保存"
+                        subtitle = "本地配置文件已经生成。"
                         if self.path == "/save-and-launch":
                             proc = launch_nexuscrew(base_dir)
                             write_launch_record(base_dir, proc.pid)
                             launch_note = f" 已启动 NexusCrew（pid={proc.pid}）。"
                             launch_report = build_launch_report(base_dir, proc.pid)
-                        payload = render_setup_html(
-                            "配置已保存到本地。现在可以关闭这个页面，并直接运行 python3 -m nexuscrew。" + launch_note,
-                            launch_ready=True,
-                            defaults=form,
-                            checks=checks,
-                            checks_heading="已保存配置摘要",
-                            launch_report=launch_report,
+                            title = "NexusCrew 已启动"
+                            subtitle = "本地配置已保存并启动了 NexusCrew。"
+                        payload = render_success_html(
+                            title=title,
+                            subtitle=subtitle + launch_note,
+                            saved_files=build_saved_files_summary(base_dir),
+                            launch_info={
+                                "pid": str(read_launch_record(base_dir).get("pid", "")) if read_launch_record(base_dir) else "",
+                                "status": "运行中" if launch_report and any("运行中" in line for line in launch_report) else "未运行",
+                                "command": "python3 -m nexuscrew",
+                            } if self.path == "/save-and-launch" else None,
                         ).encode("utf-8")
                         self.send_response(200)
                 except Exception as err:

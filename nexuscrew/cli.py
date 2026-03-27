@@ -1,11 +1,34 @@
 """CLI entry point: nexuscrew start [--config crew.yaml]."""
 import argparse
+import socket
 from pathlib import Path
 
 from .config import load_crew_config
 from .local_secrets import load_local_secrets
 from .setup_wizard import SetupWizardServer
 from .telegram.bot import NexusCrewBot
+
+
+def _discover_bind_addresses(host: str) -> list[str]:
+    if host not in ("0.0.0.0", "::"):
+        return [host]
+    candidates = ["127.0.0.1"]
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, family=socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127."):
+                continue
+            if ip not in candidates:
+                candidates.append(ip)
+    except OSError:
+        pass
+    return candidates
+
+
+def _format_setup_urls(host: str, port: int) -> str:
+    urls = [f"http://{addr}:{port}/setup" for addr in _discover_bind_addresses(host)]
+    return " / ".join(urls)
 
 
 def main():
@@ -23,7 +46,7 @@ def main():
         help="crew.yaml 配置文件路径（可选，也可通过 /crew 或 /load 命令加载）",
     )
     setup = sub.add_parser("setup", help="启动首次配置 Web UI")
-    setup.add_argument("--host", type=str, default="127.0.0.1")
+    setup.add_argument("--host", type=str, default="0.0.0.0")
     setup.add_argument("--port", type=int, default=8766)
 
     args = parser.parse_args()
@@ -35,7 +58,7 @@ def main():
 
     if args.command == "setup":
         wizard = SetupWizardServer(Path.cwd(), host=args.host, port=args.port)
-        print(f"NexusCrew Setup Wizard 已启动: http://{args.host}:{args.port}/setup")
+        print(f"NexusCrew Setup Wizard 已启动: {_format_setup_urls(args.host, args.port)}")
         wizard.serve_forever()
         return
 
@@ -43,10 +66,10 @@ def main():
         raise SystemExit(f"未知命令: {args.command}")
 
     if not cfg.TELEGRAM_BOT_TOKEN or cfg.TELEGRAM_BOT_TOKEN.startswith("YOUR_"):
-        host = "127.0.0.1"
+        host = "0.0.0.0"
         port = 8766
         wizard = SetupWizardServer(Path.cwd(), host=host, port=port)
-        print(f"未检测到有效 secrets.py，已启动配置向导: http://{host}:{port}/setup")
+        print(f"未检测到有效 secrets.py，已启动配置向导: {_format_setup_urls(host, port)}")
         wizard.serve_forever()
         return
 

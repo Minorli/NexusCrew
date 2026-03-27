@@ -1,9 +1,12 @@
 """Core orchestrator — agent chain runner."""
 import asyncio
 import json
+import re
 import time
+from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
+from .agents.base import AgentArtifacts
 from .artifacts import ArtifactRecord, ArtifactStore
 from .git.ci import CIResult, CIResultProvider
 from .git.merge_gate import MergeGate
@@ -27,10 +30,11 @@ from .runtime.sqlite_store import DurableStateStore
 from .runtime.stuck import StuckDetector
 from .runtime.store import EventStore
 from .slack.sync import NullSlackSync
-from .task_state import TaskStatus, TaskTracker
+from .task_state import Task, TaskStatus, TaskTracker
 
 MAX_CHAIN_HOPS = 10
 MAX_DEV_RETRY  = 5
+_CODE_BLOCK_RE = re.compile(r"```(?:bash|sh)?\n.*?\n```", re.DOTALL)
 
 
 class Orchestrator:
@@ -39,6 +43,11 @@ class Orchestrator:
                  max_chain_hops: int = MAX_CHAIN_HOPS,
                  max_dev_retry: int = MAX_DEV_RETRY,
                  pressure_max_prompt_len: int = 500,
+                 hr_auto_eval_daily_limit: int = 1,
+                 agent_heartbeat_seconds: int = 20,
+                 agent_max_silence_seconds: int = 120,
+                 task_stage_sla_seconds: int = 600,
+                 task_watchdog_interval_seconds: int = 60,
                  event_store: EventStore | None = None,
                  github_sync=None,
                  checkpoint_store: CheckpointStore | None = None,
@@ -58,10 +67,16 @@ class Orchestrator:
         self.max_hops      = max_chain_hops
         self.max_retry     = max_dev_retry
         self.pressure_max_prompt_len = pressure_max_prompt_len
+        self.hr_auto_eval_daily_limit = max(int(hr_auto_eval_daily_limit), 0)
+        self.agent_heartbeat_seconds = max(int(agent_heartbeat_seconds), 1)
+        self.agent_max_silence_seconds = max(int(agent_max_silence_seconds), self.agent_heartbeat_seconds)
+        self.task_stage_sla_seconds = max(int(task_stage_sla_seconds), 30)
+        self.task_watchdog_interval_seconds = max(int(task_watchdog_interval_seconds), 10)
         # per chat_id state
         self._histories: dict[int, list[dict]] = {}
         self._dev_retries: dict[int, int]       = {}
         self._evaluation_counter = 0
+        self._hr_auto_eval_counts: dict[tuple[int, str], int] = {}
         self._task_branch_attempts: set[tuple[int, str]] = set()
         self._paused_tasks: set[tuple[int, str]] = set()
         self._task_run_ids: dict[tuple[int, str], str] = {}
@@ -97,6 +112,7 @@ class Orchestrator:
         self.task_tracker = TaskTracker()
         self._stuck_reports: dict[tuple[int, str], object] = {}
         self._ci_overrides: dict[str, CIResult] = {}
+        self._task_watchdog_sent_at: dict[tuple[int, str], float] = {}
         self._restore_tasks_from_state()
 
     # ── history helpers ───────────────────────────────────────────────
@@ -119,6 +135,7 @@ class Orchestrator:
         initial_agent=None,
         run_id: str | None = None,
         task=None,
+        visited: set[str] | None = None,
     ):
         """
         Run the agent chain starting from initial_agent (or router default).
@@ -129,6 +146,11 @@ class Orchestrator:
         if not agent:
             await send("[NexusCrew] 没有可用的 Agent，请先使用 /crew 编组。")
             return
+        visited = set(visited or [])
+        if agent.name in visited:
+            await send(f"⚠️ 检测到 @{agent.name} 的循环路由，停止当前链路。")
+            return
+        visited.add(agent.name)
 
         run_id = run_id or self._new_run_id()
         task, task_created = self._ensure_task(
@@ -201,17 +223,36 @@ class Orchestrator:
                     self._dev_retries[chat_id] = 0
 
             # Call agent
-            await send(f"_[{agent.name}/{agent.model_label} 处理中...]_")
             history  = self._histories.get(chat_id, [])
             memory   = self.retriever.retrieve(agent.role, agent.name, task.id)
             self.executor.set_context(chat_id, task.id, run_id)
             metrics = self.metrics.get(agent.name)
             metrics.record_task_start()
             t0 = time.monotonic()
-            reply, artifacts = await agent.handle(message, history, memory)
+            reply, artifacts, timed_out = await self._run_agent_with_watchdog(
+                run_id,
+                chat_id,
+                task,
+                agent,
+                message,
+                history,
+                memory,
+                send,
+            )
+            reply, artifacts = await self._enforce_substantive_reply(
+                task,
+                agent,
+                message,
+                history,
+                memory,
+                reply,
+                artifacts,
+            )
             metrics.record_task_complete(
                 int((time.monotonic() - t0) * 1000)
             )
+            if timed_out:
+                metrics.record_task_fail()
             laziness_signals = detect_laziness(
                 reply,
                 agent.role,
@@ -246,9 +287,24 @@ class Orchestrator:
                     elif any(keyword in reply for keyword in ("打回", "修复", "reject", "问题")):
                         self.metrics.get(reviewed_dev.name).record_review_result(False)
 
+            public_reply = await self._build_public_reply(
+                chat_id,
+                task,
+                agent,
+                reply,
+                artifacts,
+            )
+            mirror_reply = self._build_mirror_reply(
+                task,
+                agent,
+                reply,
+                artifacts,
+                public_reply,
+            )
+
             # Send reply + shell output to Telegram
             self._add_history(chat_id, agent.name, reply)
-            await send(f"**[{agent.name}]**\n{reply}", agent_name=agent.name)
+            await send(public_reply, agent_name=agent.name)
             self._record_event(
                 run_id,
                 chat_id,
@@ -265,14 +321,10 @@ class Orchestrator:
                 summary=reply[:120],
                 content=reply,
             ))
-            await self.github_sync.mirror_comment(task, agent.name, reply)
-            await self.slack_sync.mirror_comment(task, agent.name, reply)
+            await self.github_sync.mirror_comment(task, agent.name, mirror_reply)
+            await self.slack_sync.mirror_comment(task, agent.name, mirror_reply)
             self.scoped_memory.append(f"task:{task.id}", agent.name, reply[:500], importance=2)
             if artifacts.shell_output:
-                await send(
-                    f"```\n{artifacts.shell_output[:3500]}\n```",
-                    agent_name=agent.name,
-                )
                 self._add_history(chat_id, "shell", artifacts.shell_output[:600])
                 self._record_event(
                     run_id,
@@ -290,16 +342,23 @@ class Orchestrator:
                     summary=artifacts.shell_output.splitlines()[0][:120],
                     content=artifacts.shell_output[:3000],
                 ))
-                await self.github_sync.mirror_comment(
-                    task,
-                    f"{agent.name}/shell",
-                    f"```\n{artifacts.shell_output[:3000]}\n```",
-                )
-                await self.slack_sync.mirror_comment(
-                    task,
-                    f"{agent.name}/shell",
-                    f"```{artifacts.shell_output[:3000]}```",
-                )
+                shell_summary = self._build_shell_summary(agent, artifacts.shell_output)
+                if shell_summary:
+                    await self.github_sync.mirror_comment(
+                        task,
+                        f"{agent.name}/run",
+                        shell_summary,
+                    )
+                    await self.slack_sync.mirror_comment(
+                        task,
+                        f"{agent.name}/run",
+                        shell_summary,
+                    )
+                    if self.executor.is_failure(artifacts.shell_output):
+                        await send(
+                            f"⚠️ [{agent.name}] 执行异常\n{shell_summary}",
+                            agent_name=agent.name,
+                        )
             self._save_checkpoint(
                 run_id=run_id,
                 chat_id=chat_id,
@@ -314,36 +373,41 @@ class Orchestrator:
             self._update_stuck_report(chat_id, task.id)
 
             # Detect next agent
-            next_agents = self.router.detect_all(reply)
+            next_agents = [
+                candidate for candidate in self.router.detect_all(reply)
+                if candidate.name != agent.name
+            ]
+            if agent.role == "pm" and self._is_status_query(message):
+                next_agents = []
             if not next_agents:
                 break
-            next_agent = next_agents[0]
-            if next_agent.name == agent.name:
-                break  # self-reference guard
 
-            # Parallel dispatch if PM mentioned multiple devs
-            if len(next_agents) > 1 and all(a.role == "dev" for a in next_agents):
-                await asyncio.gather(*[
-                    self.run_chain(
+            # Fan out when an agent explicitly hands work to multiple teammates.
+            if len(next_agents) > 1:
+                for next_agent in next_agents:
+                    await self.run_chain(
                         reply,
                         chat_id,
                         send,
-                        a,
+                        next_agent,
                         run_id=run_id,
                         task=task,
+                        visited=visited,
                     )
-                    for a in next_agents
-                ])
                 self._record_event(
                     run_id,
                     chat_id,
                     "run_completed",
                     "system",
                     task,
-                    {"mode": "parallel_dev_dispatch"},
+                    {"mode": "sequential_fanout", "targets": [a.name for a in next_agents]},
                 )
                 return
 
+            next_agent = next_agents[0]
+            if next_agent.name in visited:
+                await send(f"⚠️ 检测到 @{next_agent.name} 的循环路由，停止当前链路。")
+                break
             message = reply
             agent   = next_agent
         else:
@@ -406,7 +470,7 @@ class Orchestrator:
             current_message=message,
         )
         hr_agent = self.registry.get_by_role("hr")
-        if hr_agent and agent.role != "hr":
+        if hr_agent and agent.role != "hr" and self._consume_hr_auto_eval_budget(chat_id):
             # Task 3.3 完成: 任务链结束后异步触发 HR 评估。
             asyncio.create_task(self._hr_evaluate(hr_agent, chat_id, send))
 
@@ -418,6 +482,350 @@ class Orchestrator:
                 return agent
         return None
 
+    async def _enforce_substantive_reply(
+        self,
+        task,
+        agent,
+        message: str,
+        history: list[dict],
+        memory: str,
+        reply: str,
+        artifacts,
+    ):
+        if not self._should_enforce_substantive_reply(agent, message):
+            return reply, artifacts
+        if not self._is_low_signal_reply(agent, reply, artifacts):
+            return reply, artifacts
+        correction = self._build_substantive_retry_prompt(agent, message, reply)
+        retry_reply, retry_artifacts = await agent.handle(
+            correction,
+            history + [{"agent": agent.name, "content": reply}],
+            memory,
+        )
+        if self._is_low_signal_reply(agent, retry_reply, retry_artifacts):
+            retry_reply = self._build_noncompliant_reply(agent, task)
+        if getattr(artifacts, "memory_note", "") and not getattr(retry_artifacts, "memory_note", ""):
+            retry_artifacts.memory_note = artifacts.memory_note
+        return retry_reply, retry_artifacts
+
+    def _should_enforce_substantive_reply(self, agent, message: str) -> bool:
+        lowered = message.lower()
+        if agent.role == "dev":
+            keywords = (
+                "修复", "实现", "处理", "测试", "pytest", "review", "代码", "模块",
+                "功能", "bug", "提交", "pr", "架构评审",
+            )
+            return any(keyword in lowered for keyword in keywords)
+        if agent.role == "architect":
+            keywords = (
+                "评审", "审查", "review", "风险", "架构", "结论", "模块", "lg tm",
+                "lgtm", "缺陷", "打回",
+            )
+            return any(keyword in lowered for keyword in keywords)
+        return False
+
+    def _is_low_signal_reply(self, agent, reply: str, artifacts) -> bool:
+        text = reply.strip()
+        normalized = text.lower().strip("。.!！？ ")
+        if agent.role == "dev":
+            if getattr(artifacts, "shell_output", ""):
+                return False
+            if "@architect" in text or "Code Review" in text or "阻塞" in text:
+                return False
+            low_signal_fragments = (
+                "收到", "我来处理", "当前最新进度", "状态如下", "可以，但这里更适合",
+                "请把具体需求", "在，我可以直接处理开发任务", "流程", "工作流",
+            )
+            return len(text) < 400 and any(fragment in text for fragment in low_signal_fragments)
+        if agent.role == "architect":
+            if "LGTM" in text.upper():
+                return False
+            if "@" in text and any(fragment in text for fragment in ("打回", "缺陷", "风险", "需改进", "需重构", "修复")):
+                return False
+            progress_fragments = (
+                "正在审计", "审计中", "读代码", "先读代码", "先看代码", "稍后", "随后",
+                "先扫", "扫描", "结果随后", "报告随后",
+            )
+            if any(fragment in text for fragment in progress_fragments):
+                return True
+            low_signal_replies = (
+                "ok", "收到", "在", "收到，先读代码再给结论", "收到，先看代码再给结论",
+                "收到，先读代码", "收到，先读代码再给结论。",
+            )
+            if normalized in low_signal_replies or len(text) < 120:
+                return True
+            substantive_markers = ("LGTM", "打回", "缺陷", "风险", "需改进", "需重构", "结论")
+            return not any(marker in text for marker in substantive_markers)
+        return False
+
+    def _build_substantive_retry_prompt(self, agent, message: str, reply: str) -> str:
+        if agent.role == "dev":
+            return (
+                f"{message}\n\n"
+                f"你刚才的回复是：{reply}\n\n"
+                "这不是可执行交付。不要汇报状态、计划或流程。"
+                "请直接执行任务并给出 bash，或者只说明一个真实阻塞点。"
+            )
+        if agent.role == "architect":
+            return (
+                f"{message}\n\n"
+                f"你刚才的回复是：{reply}\n\n"
+                "这不是有效评审。请直接给出评审结论："
+                "LGTM，或列出具体缺陷并 @具体负责人。不要只确认收到。"
+            )
+        return message
+
+    async def _run_agent_with_watchdog(
+        self,
+        run_id: str,
+        chat_id: int,
+        task,
+        agent,
+        message: str,
+        history: list[dict],
+        memory: str,
+        send,
+    ):
+        handle_task = asyncio.create_task(agent.handle(message, history, memory))
+        elapsed = 0
+        while True:
+            done, _ = await asyncio.wait(
+                {handle_task},
+                timeout=self.agent_heartbeat_seconds,
+            )
+            if done:
+                reply, artifacts = await handle_task
+                return reply, artifacts, False
+
+            elapsed += self.agent_heartbeat_seconds
+            self._record_event(
+                run_id,
+                chat_id,
+                "agent_heartbeat",
+                "system",
+                task,
+                {"agent": agent.name, "elapsed": elapsed},
+            )
+            await send(
+                f"⏳ @{agent.name} 仍在处理任务 {task.id}，已等待 {elapsed}s。",
+            )
+            if elapsed >= self.agent_max_silence_seconds:
+                handle_task.cancel()
+                try:
+                    await handle_task
+                except BaseException:
+                    pass
+                reply = self._build_agent_timeout_reply(agent, task)
+                self._record_event(
+                    run_id,
+                    chat_id,
+                    "agent_timeout",
+                    "system",
+                    task,
+                    {"agent": agent.name, "elapsed": elapsed},
+                )
+                return reply, AgentArtifacts(), True
+
+    def _build_agent_timeout_reply(self, agent, task) -> str:
+        task_id = task.id if task else "unknown"
+        if agent.role == "dev":
+            arch = self.registry.get_by_role("architect")
+            if arch:
+                return f"⚠️ @{agent.name} 在任务 {task_id} 上响应超时。@{arch.name} 请接手排障。"
+            return f"⚠️ @{agent.name} 在任务 {task_id} 上响应超时，请人工介入。"
+        if agent.role == "architect":
+            pm = self.router.default_agent()
+            if pm:
+                return f"⚠️ @{agent.name} 在任务 {task_id} 上评审超时。@{pm.name} 请调整计划或改派。"
+            return f"⚠️ @{agent.name} 在任务 {task_id} 上评审超时，请人工介入。"
+        if agent.role == "pm":
+            return f"⚠️ @{agent.name} 在任务 {task_id} 上编排超时，请人工介入。"
+        return f"⚠️ @{agent.name} 在任务 {task_id} 上响应超时，请人工介入。"
+
+    def _build_noncompliant_reply(self, agent, task) -> str:
+        task_id = task.id if task else "unknown"
+        if agent.role == "dev":
+            arch = self.registry.get_by_role("architect")
+            if arch:
+                return f"⚠️ @{agent.name} 未给出可执行交付。@{arch.name} 请接手排障（task {task_id}）。"
+            return f"⚠️ @{agent.name} 未给出可执行交付，请人工介入（task {task_id}）。"
+        if agent.role == "architect":
+            pm = self.router.default_agent()
+            if pm:
+                return f"⚠️ @{agent.name} 未给出有效评审结论。@{pm.name} 请调整计划或改派（task {task_id}）。"
+            return f"⚠️ @{agent.name} 未给出有效评审结论，请人工介入（task {task_id}）。"
+        if agent.role == "pm":
+            return f"⚠️ @{agent.name} 未给出有效编排结果，请人工介入（task {task_id}）。"
+        return f"⚠️ @{agent.name} 未给出有效结果，请人工介入（task {task_id}）。"
+
+    def _is_status_query(self, message: str) -> bool:
+        lowered = message.lower()
+        hints = (
+            "进度", "状态", "在吗", "有没有更新", "然后呢", "看下", "看看", "很久没", "没有进度",
+            "大家的状态", "成员状态", "目前状态",
+        )
+        return any(hint in lowered for hint in hints)
+
+    async def watchdog_tick(
+        self,
+        send_factory,
+        active_task_ids: set[str] | None = None,
+        notify_chat: bool = False,
+    ) -> list[str]:
+        alerts: list[str] = []
+        now = time.monotonic()
+        active_task_ids = set(active_task_ids or set())
+        for chat_id, tasks in self.task_tracker._tasks.items():
+            stale_running: list[tuple[Task, float]] = []
+            auto_closed: list[tuple[Task, float]] = []
+            for task in tasks.values():
+                if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
+                    continue
+                age = (datetime.now() - task.last_activity_at()).total_seconds()
+                if age < self.task_stage_sla_seconds:
+                    continue
+                if task.id not in active_task_ids:
+                    task.status = TaskStatus.FAILED
+                    task.updated_at = datetime.now().isoformat()
+                    task.history.append(
+                        f"auto_failed_by_watchdog at {task.updated_at} age={int(age)}s"
+                    )
+                    self.state_store.save_task(chat_id, task)
+                    self._record_event(
+                        self._task_run_ids.get((chat_id, task.id), self._new_run_id()),
+                        chat_id,
+                        "task_auto_failed",
+                        "system",
+                        task,
+                        {"age_seconds": int(age), "assigned_to": task.assigned_to, "status": task.status.value},
+                    )
+                    auto_closed.append((task, age))
+                    alerts.append(task.id)
+                    continue
+                key = (chat_id, task.id)
+                if now - self._task_watchdog_sent_at.get(key, 0) < self.task_watchdog_interval_seconds:
+                    continue
+                self._task_watchdog_sent_at[key] = now
+                stale_running.append((task, age))
+                alerts.append(task.id)
+            if stale_running or auto_closed:
+                send = send_factory(chat_id)
+                if notify_chat:
+                    await send(self._build_task_watchdog_digest(stale_running, auto_closed))
+                for task, age in stale_running:
+                    self._record_event(
+                        self._task_run_ids.get((chat_id, task.id), self._new_run_id()),
+                        chat_id,
+                        "task_stale",
+                        "system",
+                        task,
+                        {"age_seconds": int(age), "assigned_to": task.assigned_to, "status": task.status.value},
+                    )
+                    task.history.append(f"watchdog_alert at {datetime.now().isoformat()} age={int(age)}s")
+                    self.state_store.save_task(chat_id, task)
+        return alerts
+
+    def _build_task_watchdog_digest(
+        self,
+        stale_running: list[tuple[Task, float]],
+        auto_closed: list[tuple[Task, float]],
+    ) -> str:
+        lines = ["⚠️ Task Watchdog"]
+        if stale_running:
+            lines.append("仍在运行但超时：")
+            for task, age in stale_running[:3]:
+                assignee = f"@{task.assigned_to}" if task.assigned_to else "@未分配"
+                lines.append(
+                    f"- {task.id} {assignee} `{task.status.value}` 静默 {int(age)}s"
+                )
+            if len(stale_running) > 3:
+                lines.append(f"- 另外 {len(stale_running) - 3} 个活跃超时任务")
+        if auto_closed:
+            lines.append("已自动收口为失败：")
+            for task, age in auto_closed[:3]:
+                assignee = f"@{task.assigned_to}" if task.assigned_to else "@未分配"
+                lines.append(
+                    f"- {task.id} {assignee} 静默 {int(age)}s，无活跃后台 run"
+                )
+            if len(auto_closed) > 3:
+                lines.append(f"- 另外 {len(auto_closed) - 3} 个历史卡死任务已归档")
+        pm = self.router.default_agent()
+        if pm:
+            lines.append(f"@{pm.name} 请推进、改派或降级方案。")
+        return "\n".join(lines)
+
+    async def _build_public_reply(self, chat_id: int, task, agent, reply: str, artifacts) -> str:
+        if agent.role != "dev":
+            return f"**[{agent.name}]**\n{self._strip_code_blocks(reply)}"
+
+        changed_files = await self.executor.git_changed_files()
+        lines = [f"**[{agent.name}]**"]
+        summary = self._summarize_dev_reply(reply)
+        if summary:
+            lines.append(summary)
+        if changed_files:
+            preview = ", ".join(changed_files[:5])
+            more = f" (+{len(changed_files) - 5})" if len(changed_files) > 5 else ""
+            lines.append(f"Files: {preview}{more}")
+        shell_summary = self._build_shell_summary(agent, getattr(artifacts, "shell_output", ""))
+        if shell_summary:
+            lines.append(f"Validation: {shell_summary}")
+        if "@architect" in reply or "Code Review 请求" in reply:
+            lines.append("Next: @architect review")
+        elif "阻塞" in reply or "求助" in reply:
+            lines.append("Next: waiting for unblock")
+        elif not changed_files and not shell_summary:
+            lines.append("已接单，正在推进。")
+        return "\n".join(lines)
+
+    def _build_mirror_reply(self, task, agent, reply: str, artifacts, public_reply: str) -> str:
+        if agent.role != "dev":
+            return self._strip_code_blocks(reply)
+        body = public_reply.split("\n", 1)[1] if "\n" in public_reply else public_reply
+        if task and getattr(task, "branch_name", ""):
+            body += f"\nBranch: `{task.branch_name}`"
+        if task and getattr(task, "github_pr_url", ""):
+            body += f"\nPR: {task.github_pr_url}"
+        return body
+
+    def _strip_code_blocks(self, text: str) -> str:
+        stripped = _CODE_BLOCK_RE.sub("[code omitted in Telegram; see artifacts / GitHub]", text).strip()
+        return stripped
+
+    def _summarize_dev_reply(self, reply: str) -> str:
+        stripped = self._strip_code_blocks(reply)
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        for line in lines:
+            if "Code Review 请求" in line or "阻塞" in line or "求助" in line:
+                return line
+        if not lines:
+            return "已执行开发步骤。"
+        summary = lines[0]
+        return summary[:220]
+
+    def _build_shell_summary(self, agent, shell_output: str) -> str:
+        if not shell_output:
+            return ""
+        lines = [line.strip() for line in shell_output.splitlines() if line.strip()]
+        pytest_line = next((line for line in lines if " passed" in line or " failed" in line), "")
+        if pytest_line:
+            return pytest_line[:220]
+        if "[approval required:" in shell_output:
+            return "需要审批后才能继续执行。"
+        if self.executor.is_failure(shell_output):
+            err_line = next(
+                (
+                    line for line in lines
+                    if any(keyword in line.lower() for keyword in ("stderr", "error", "failed", "traceback", "fatal", "timeout"))
+                ),
+                lines[-1] if lines else "执行失败",
+            )
+            return err_line[:220]
+        command_count = sum(1 for line in lines if line.startswith("$ "))
+        if command_count:
+            return f"执行了 {command_count} 个步骤，日志已归档。"
+        return "执行完成，日志已归档。"
+
     async def _hr_evaluate(self, hr_agent, chat_id: int, send):
         try:
             summary = self.metrics.all_summaries()
@@ -427,7 +835,9 @@ class Orchestrator:
                 "请评估以下任务链路中各 Agent 的表现：\n\n"
                 f"【团队指标】\n{summary}\n\n"
                 f"【异常信号】\n{self._build_laziness_summary()}\n\n"
-                "请使用 3.25/3.5/3.75 评分体系，输出绩效评估报告。"
+                "请使用 3.25/3.5/3.75 评分体系，但只输出简短绩效摘要："
+                "1. 总评；2. 关键风险；3. 下一步动作。"
+                "不要表格，不要长篇背景，最多 6 行。"
             )
             reply, artifacts = await hr_agent.handle(prompt, history, memory)
             if artifacts.memory_note:
@@ -468,6 +878,17 @@ class Orchestrator:
                 ))
         except Exception as err:
             await send(f"[HR 评估异常] {err}")
+
+    def _consume_hr_auto_eval_budget(self, chat_id: int) -> bool:
+        if self.hr_auto_eval_daily_limit <= 0:
+            return False
+        today = date.today().isoformat()
+        key = (chat_id, today)
+        used = self._hr_auto_eval_counts.get(key, 0)
+        if used >= self.hr_auto_eval_daily_limit:
+            return False
+        self._hr_auto_eval_counts[key] = used + 1
+        return True
 
     def _derive_pressure_score(self, metrics) -> float:
         if metrics.retry_ratio > 2.0:
