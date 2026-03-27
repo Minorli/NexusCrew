@@ -3,6 +3,7 @@ import asyncio
 import json
 import urllib.request
 from dataclasses import asdict, dataclass
+from ..http_retry import with_retries, NETWORK_ERRORS
 
 
 @dataclass
@@ -53,7 +54,9 @@ class PRWorkflow:
             return draft
         if draft.base == "unknown":
             return draft
-        created = await asyncio.to_thread(self._create_pull_request, draft)
+        ok, created = self._safe_create_pull_request(draft)
+        if not ok:
+            return draft
         draft.number = created["number"]
         draft.url = created["html_url"]
         task.github_pr_number = draft.number
@@ -63,23 +66,32 @@ class PRWorkflow:
         return draft
 
     def _create_pull_request(self, draft: PullRequestDraft) -> dict:
-        payload = json.dumps({
-            "title": draft.title,
-            "body": draft.body,
-            "head": draft.head,
-            "base": draft.base,
-            "draft": True,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.api_url}/repos/{self.repo}/pulls",
-            data=payload,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        def do_request():
+            payload = json.dumps({
+                "title": draft.title,
+                "body": draft.body,
+                "head": draft.head,
+                "base": draft.base,
+                "draft": True,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.api_url}/repos/{self.repo}/pulls",
+                data=payload,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        return with_retries(do_request)
+
+    def _safe_create_pull_request(self, draft: PullRequestDraft):
+        try:
+            return True, self._create_pull_request(draft)
+        except NETWORK_ERRORS:
+            return False, None

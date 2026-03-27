@@ -132,6 +132,27 @@ class ShellExecutor:
                 return stripped
         return "unknown"
 
+    async def git_changed_files(self, limit: int = 8) -> list[str]:
+        result = await asyncio.to_thread(
+            self._run_one,
+            "git status --porcelain",
+        )
+        lowered = result.lower()
+        if "not a git repository" in lowered or "fatal:" in lowered:
+            return []
+        files: list[str] = []
+        for line in result.splitlines():
+            if not line or line.startswith("$") or line.startswith("[stderr]"):
+                continue
+            payload = line[3:].strip() if len(line) >= 4 else line.strip()
+            if "->" in payload:
+                payload = payload.split("->", 1)[1].strip()
+            if payload and payload not in files:
+                files.append(payload)
+            if len(files) >= limit:
+                break
+        return files
+
     def list_pending_approvals(self):
         return self.approval_manager.list_pending()
 

@@ -23,6 +23,7 @@ class BackgroundRun:
 
 class BackgroundTaskRunner:
     """Track and manage background async tasks."""
+    TERMINAL_STATUSES = {"completed", "failed", "cancelled", "recovered"}
 
     def __init__(self, state_store=None):
         # Task A4 完成: 后台任务执行器与可查询状态。
@@ -62,7 +63,18 @@ class BackgroundTaskRunner:
         if self._state_store is not None:
             self._state_store.save_background_run(job)
 
-    def submit(self, label: str, coro, chat_id: int = 0, task_id: str = "", run_id: str = "") -> str:
+    def submit(
+        self,
+        label: str,
+        coro,
+        chat_id: int = 0,
+        task_id: str = "",
+        run_id: str = "",
+        on_error=None,
+        on_heartbeat=None,
+        heartbeat_interval: float = 45,
+        first_heartbeat_delay: float = 20,
+    ) -> str:
         self._counter += 1
         job_id = f"BG-{self._counter:04d}"
         job = BackgroundRun(
@@ -73,18 +85,48 @@ class BackgroundTaskRunner:
             run_id=run_id,
         )
         self._jobs[job_id] = job
-        self._start_job(job, coro)
+        self._start_job(
+            job,
+            coro,
+            on_error=on_error,
+            on_heartbeat=on_heartbeat,
+            heartbeat_interval=heartbeat_interval,
+            first_heartbeat_delay=first_heartbeat_delay,
+        )
         return job_id
 
-    def resume_existing(self, job_id: str, coro) -> bool:
+    def resume_existing(
+        self,
+        job_id: str,
+        coro,
+        on_error=None,
+        on_heartbeat=None,
+        heartbeat_interval: float = 45,
+        first_heartbeat_delay: float = 20,
+    ) -> bool:
         job = self._jobs.get(job_id)
         if job is None:
             return False
         # Continue the original background run under the same job id.
-        self._start_job(job, coro)
+        self._start_job(
+            job,
+            coro,
+            on_error=on_error,
+            on_heartbeat=on_heartbeat,
+            heartbeat_interval=heartbeat_interval,
+            first_heartbeat_delay=first_heartbeat_delay,
+        )
         return True
 
-    def _start_job(self, job: BackgroundRun, coro):
+    def _start_job(
+        self,
+        job: BackgroundRun,
+        coro,
+        on_error=None,
+        on_heartbeat=None,
+        heartbeat_interval: float = 45,
+        first_heartbeat_delay: float = 20,
+    ):
         self._persist(job)
 
         async def runner():
@@ -93,12 +135,32 @@ class BackgroundTaskRunner:
             job.touch()
             self._persist(job)
             try:
-                await coro
+                if on_heartbeat is None:
+                    await coro
+                else:
+                    task = asyncio.create_task(coro)
+                    timeout = max(first_heartbeat_delay, 0.01)
+                    interval = max(heartbeat_interval, 0.01)
+                    while True:
+                        done, _ = await asyncio.wait({task}, timeout=timeout)
+                        if done:
+                            await task
+                            break
+                        job.touch()
+                        self._persist(job)
+                        await on_heartbeat(job)
+                        timeout = interval
                 if job.status != "cancelled":
                     job.status = "completed"
                     job.touch()
                     self._persist(job)
             except asyncio.CancelledError:
+                if on_heartbeat is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
                 job.status = "cancelled"
                 job.touch()
                 self._persist(job)
@@ -108,11 +170,37 @@ class BackgroundTaskRunner:
                 job.error = str(err)
                 job.touch()
                 self._persist(job)
+                if on_error is not None:
+                    try:
+                        await on_error(job, err)
+                    except Exception:
+                        pass
 
         self._tasks[job.id] = asyncio.create_task(runner())
 
     def list_runs(self) -> list[BackgroundRun]:
         return [self._jobs[job_id] for job_id in sorted(self._jobs)]
+
+    def list_active_runs(self) -> list[BackgroundRun]:
+        return [
+            job for job in self.list_runs()
+            if job.status not in self.TERMINAL_STATUSES
+        ]
+
+    def list_failed_runs(self) -> list[BackgroundRun]:
+        jobs = [job for job in self.list_runs() if job.status == "failed"]
+        return sorted(
+            jobs,
+            key=lambda job: job.updated_at or job.created_at,
+            reverse=True,
+        )
+
+    def active_task_ids(self) -> set[str]:
+        return {
+            job.task_id
+            for job in self.list_active_runs()
+            if getattr(job, "task_id", "")
+        }
 
     def get(self, job_id: str) -> BackgroundRun | None:
         return self._jobs.get(job_id)
@@ -157,10 +245,28 @@ class BackgroundTaskRunner:
         return True
 
     def format_status(self) -> str:
-        jobs = self.list_runs()
+        jobs = self.list_active_runs()
         if not jobs:
-            return "当前无后台任务。"
-        lines = ["🧵 后台任务：", ""]
+            failed_count = len(self.list_failed_runs())
+            if failed_count:
+                return f"当前无活跃后台任务。\n\n失败归档: {failed_count}，使用 /failed 查看详情。"
+            return "当前无活跃后台任务。"
+        lines = ["🧵 活跃后台任务：", ""]
         for job in jobs:
             lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
+        failed_count = len(self.list_failed_runs())
+        if failed_count:
+            lines.extend(["", f"失败归档: {failed_count}，使用 /failed 查看详情。"])
+        return "\n".join(lines)
+
+    def format_failed(self) -> str:
+        jobs = self.list_failed_runs()
+        if not jobs:
+            return "当前无失败后台任务。"
+        lines = ["🗂️ 失败后台任务归档：", ""]
+        for job in jobs:
+            error = (job.error or "(无错误详情)")[:200]
+            lines.append(f"  [{job.id}] {job.label[:50]}")
+            lines.append(f"    task={job.task_id or '-'} updated={job.updated_at or job.created_at}")
+            lines.append(f"    error={error}")
         return "\n".join(lines)

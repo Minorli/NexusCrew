@@ -1,7 +1,8 @@
-"""HR Agent — technical HRBP backed by Gemini CLI."""
+"""HR Agent — technical HRBP backed by Claude or Gemini."""
 import asyncio
 
 from .base import AgentArtifacts, BaseAgent
+from ..backends.anthropic_backend import AnthropicBackend
 from ..backends.gemini_cli import GeminiCLIBackend
 
 HR_PROMPT = """\
@@ -29,14 +30,21 @@ HR_PROMPT = """\
 【输出规范】
 - 督促/干预消息需 @目标Agent 并抄送 @PM。
 - 周期性报告自动 @Human。
-- 绩效报告使用表格格式。"""
+- 默认输出短摘要，不要长篇背景，不要大段复述上下文。
+- 默认最多 6 行；只有 Human 明确要求“详细报告”时才展开。
+- 自动绩效评估默认使用：总评 / 风险 / 动作 三段短句，不使用表格。"""
 
 
 class HRAgent(BaseAgent):
-    def __init__(self, name: str, backend: GeminiCLIBackend,
-                 system_prompt_extra: str = ""):
+    def __init__(
+        self,
+        name: str,
+        backend: AnthropicBackend | GeminiCLIBackend,
+        system_prompt_extra: str = "",
+        model_label: str = "claude",
+    ):
         # Task 3.1 完成: 新增 HR Agent 骨架。
-        super().__init__(name, "hr", "gemini", system_prompt_extra)
+        super().__init__(name, "hr", model_label, system_prompt_extra)
         self.backend = backend
 
     async def handle(
@@ -49,12 +57,20 @@ class HRAgent(BaseAgent):
             HR_PROMPT.format(name=self.name),
             crew_memory,
         )
-        history_text = "\n".join(
-            f"[{m.get('agent', '?')}]: {m['content'][:400]}"
-            for m in history[-12:]
-        )
-        prompt = f"{system}\n\n【近期对话】\n{history_text}\n\n【当前消息】\n{message}"
-        reply = await asyncio.to_thread(self.backend.complete, prompt)
+        if self.model_label == "claude":
+            messages = []
+            for item in history[-12:]:
+                role = "assistant" if item.get("agent") == self.name else "user"
+                messages.append({"role": role, "content": item["content"][:800]})
+            messages.append({"role": "user", "content": message})
+            reply = await asyncio.to_thread(self.backend.complete, system, messages)
+        else:
+            history_text = "\n".join(
+                f"[{m.get('agent', '?')}]: {m['content'][:400]}"
+                for m in history[-12:]
+            )
+            prompt = f"{system}\n\n【近期对话】\n{history_text}\n\n【当前消息】\n{message}"
+            reply = await asyncio.to_thread(self.backend.complete, prompt)
         artifacts = AgentArtifacts()
         if "【MEMORY】" in reply:
             reply, artifacts.memory_note = reply.split("【MEMORY】", 1)

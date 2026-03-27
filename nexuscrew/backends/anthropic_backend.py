@@ -1,4 +1,5 @@
 """Anthropic backend — uses anthropic.Anthropic (sync) for Claude."""
+import re
 import time
 
 import anthropic
@@ -39,14 +40,20 @@ class AnthropicBackend:
             }
 
         last_err = None
+        degraded_thinking = False
+        degraded_model = False
         for attempt in range(self.max_retries):
             try:
                 resp = self._client.messages.create(**kwargs)
                 text_parts = [
                     block.text for block in resp.content
-                    if hasattr(block, "text")
+                    if hasattr(block, "text") and getattr(block, "type", "text") == "text"
                 ]
-                return "\n".join(text_parts)
+                text = "\n".join(text_parts)
+                # Some compatible providers may still inline <thinking> blocks into
+                # text output; strip them before sending to users.
+                text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+                return text
             except anthropic.RateLimitError as err:
                 last_err = err
                 time.sleep(min((2 ** attempt) * 5, 60))
@@ -54,7 +61,24 @@ class AnthropicBackend:
                 last_err = err
             except anthropic.APIError as err:
                 last_err = err
-                if getattr(err, "status_code", None) and err.status_code >= 500:
+                status_code = getattr(err, "status_code", None)
+                # Some proxy providers intermittently reject thinking-enabled or
+                # premium-model requests with 403. Degrade once before failing.
+                if status_code == 403 and kwargs.get("thinking") and not degraded_thinking:
+                    kwargs.pop("thinking", None)
+                    degraded_thinking = True
+                    continue
+                if (
+                    status_code == 403
+                    and self.model_light
+                    and kwargs.get("model") != self.model_light
+                    and not degraded_model
+                ):
+                    kwargs["model"] = self.model_light
+                    kwargs.pop("thinking", None)
+                    degraded_model = True
+                    continue
+                if status_code and status_code >= 500:
                     time.sleep(2 ** attempt)
                     continue
                 break

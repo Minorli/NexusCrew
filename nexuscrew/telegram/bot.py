@@ -1,6 +1,7 @@
 """Telegram bot — handlers and setup."""
 import asyncio
 import concurrent.futures
+import copy
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from ..backends.anthropic_backend import AnthropicBackend
 from ..executor.shell import ShellExecutor
 from ..git.pr import PRWorkflow
 from ..git.webhooks import GitHubWebhookServer
+from ..drill import TeamDrillRunner
 from ..local_secrets import load_local_secrets
 from ..policy.access import AccessController
 from ..router import Router
@@ -44,10 +46,10 @@ cfg = load_local_secrets()
 
 
 MODEL_DEFAULTS = {
-    "pm": "gemini",
+    "pm": "claude",
     "dev": "codex",
     "architect": "claude",
-    "hr": "gemini",
+    "hr": "claude",
 }
 
 
@@ -56,16 +58,16 @@ def _make_backend(model: str, executor: ShellExecutor, spec: dict):
         return GeminiCLIBackend(
             cfg.GEMINI_CLI_CMD,
             cfg.GEMINI_PROMPT_FLAG,
-            model=spec.get("gemini_model", getattr(cfg, "GEMINI_MODEL", None)),
+            model=spec.get("gemini_model") or getattr(cfg, "GEMINI_MODEL", None),
         )
     if model == "codex":
-        openai_model = spec.get("openai_model", cfg.OPENAI_MODEL)
+        openai_model = spec.get("openai_model") or cfg.OPENAI_MODEL
         return OpenAIBackend(cfg.OPENAI_API_KEY, cfg.OPENAI_BASE_URL, openai_model)
     if model == "claude":
-        anthropic_model = spec.get("anthropic_model", cfg.ANTHROPIC_MODEL)
-        anthropic_model_light = spec.get(
-            "anthropic_model_light",
-            getattr(cfg, "ANTHROPIC_MODEL_SONNET", None),
+        anthropic_model = spec.get("anthropic_model") or cfg.ANTHROPIC_MODEL
+        anthropic_model_light = (
+            spec.get("anthropic_model_light")
+            or getattr(cfg, "ANTHROPIC_MODEL_SONNET", None)
         )
         return AnthropicBackend(
             cfg.ANTHROPIC_API_KEY, anthropic_model,
@@ -80,13 +82,13 @@ def _make_agent(role: str, name: str, model: str, executor: ShellExecutor,
     spec = spec or {}
     backend = _make_backend(model, executor, spec)
     if role == "pm":
-        return PMAgent(name, backend, extra)
+        return PMAgent(name, backend, extra, model_label=model)
     if role == "dev":
         return DevAgent(name, backend, executor, extra)
     if role == "architect":
         return ArchitectAgent(name, backend, extra)
     if role == "hr":
-        return HRAgent(name, backend, extra)
+        return HRAgent(name, backend, extra, model_label=model)
     raise ValueError(f"Unknown role: {role}")
 
 
@@ -122,6 +124,7 @@ class NexusCrewBot:
         self._app = None
         self._bot_pool: AgentBotPool | None = None
         self.preload_config: CrewConfig | None = None
+        self.current_config: CrewConfig | None = None
         self._github_sync = NullGitHubSync()
         self._slack_sync = NullSlackSync()
         self._runner = BackgroundTaskRunner()
@@ -132,7 +135,9 @@ class NexusCrewBot:
         self._slack_commands: SlackCommandServer | None = None
         self._slack_app_home: SlackAppHomePublisher | None = None
         self._slack_home_refresh_task: asyncio.Task | None = None
+        self._task_watchdog_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._startup_warnings: list[str] = []
         self._access = AccessController(
             operator_ids=list(getattr(cfg, "TELEGRAM_OPERATOR_USER_IDS", [])),
             approver_ids=list(getattr(cfg, "TELEGRAM_APPROVER_USER_IDS", [])),
@@ -182,6 +187,7 @@ class NexusCrewBot:
             "  @alice 帮我加 Redis 缓存\n"
             "  /status   — 查看当前 Agent\n"
             "  /tasks    — 查看后台任务\n"
+            "  /failed   — 查看失败后台任务归档\n"
             "  /approvals — 查看待审批动作\n"
             "  /memory   — 查看共享记忆\n"
             "  /reset    — 清空对话历史\n"
@@ -189,7 +195,8 @@ class NexusCrewBot:
             "  /task <task_id> / /cancel <job_id>\n"
             "  /approve <approval_id> / /reject <approval_id>\n"
             "  /new <desc> / /doctor / /handoff <task_id> <agent> / /skills\n"
-            "  /trace <task_id> / /artifacts <task_id> / /pr <task_id> / /ci <task_id> / /board"
+            "  /trace <task_id> / /artifacts <task_id> / /pr <task_id> / /ci <task_id> / /board\n"
+            "  /drill [team] — 运行内部协作演练并输出验收报告"
         )
 
     async def _apply_config(self, config: CrewConfig) -> str:
@@ -227,11 +234,17 @@ class NexusCrewBot:
             executor,
             max_chain_hops=config.orchestrator.max_chain_hops,
             max_dev_retry=config.orchestrator.max_dev_retry,
+            agent_heartbeat_seconds=config.orchestrator.agent_heartbeat_seconds,
+            agent_max_silence_seconds=config.orchestrator.agent_max_silence_seconds,
+            task_stage_sla_seconds=config.orchestrator.task_stage_sla_seconds,
+            task_watchdog_interval_seconds=config.orchestrator.task_watchdog_interval_seconds,
             pressure_max_prompt_len=config.hr.pressure_max_prompt_len,
+            hr_auto_eval_daily_limit=config.hr.auto_eval_daily_limit,
             github_sync=self._github_sync,
             slack_sync=self._slack_sync,
             pr_workflow=self._build_pr_workflow(),
         )
+        self.current_config = copy.deepcopy(config)
 
         roster = status_table(self.registry.list_all())
         self.crew_memory.overwrite_section("当前编组", roster)
@@ -263,6 +276,8 @@ class NexusCrewBot:
     async def _post_init(self, app) -> None:
         del app
         self._loop = asyncio.get_running_loop()
+        self._start_slack_home_refresh_if_enabled()
+        self._start_task_watchdog_if_enabled()
         if self.preload_config is None:
             return
         # Task 2.4 完成: CLI 支持启动时预加载 crew.yaml。
@@ -311,6 +326,9 @@ class NexusCrewBot:
 
     async def cmd_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(self._service().tasks_text())
+
+    async def cmd_failed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(self._service().failed_text())
 
     async def cmd_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._orch:
@@ -439,6 +457,47 @@ class NexusCrewBot:
     async def cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(self._service().skills_text())
 
+    async def cmd_drill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if self.current_config is None or self._orch is None:
+            await update.message.reply_text("请先初始化编组。")
+            return
+        scenario = context.args[0] if context.args else "team"
+        chat_id = update.message.chat_id
+
+        async def run_drill():
+            runner = TeamDrillRunner(
+                self.current_config,
+                lambda spec, executor: _make_agent(
+                    spec.role,
+                    spec.name,
+                    spec.model,
+                    executor,
+                    spec.system_prompt_extra,
+                    spec=vars(spec),
+                ),
+            )
+            report = await runner.run(scenario)
+            await self._send_as(chat_id, None, report.report_text)
+
+        async def on_error(job, err):
+            await self._send_as(chat_id, None, f"⚠️ Drill {scenario} 执行失败：{err}")
+
+        async def on_heartbeat(job):
+            await self._send_as(chat_id, None, f"⏳ Drill {scenario} 仍在运行，正在做协作验收。")
+
+        self._runner.submit(
+            f"drill:{scenario}",
+            run_drill(),
+            chat_id=chat_id,
+            on_error=on_error,
+            on_heartbeat=on_heartbeat,
+            first_heartbeat_delay=10,
+            heartbeat_interval=30,
+        )
+        await update.message.reply_text(f"🧪 Drill {scenario} 已开始，完成后会回报告。")
+
     async def cmd_trace(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._require_operate(update):
             return
@@ -523,8 +582,7 @@ class NexusCrewBot:
             return
         msg = update.message.text
         send = self._make_send(chat_id)
-        job_id = self._service().submit_message(chat_id, msg, send)
-        await update.message.reply_text(f"后台任务已启动: {job_id}")
+        self._service().submit_message(chat_id, msg, send)
         await self._update_status_board(chat_id)
 
     def build_app(self):
@@ -537,12 +595,12 @@ class NexusCrewBot:
         self._start_dashboard_if_enabled()
         self._start_github_webhook_if_enabled()
         self._start_slack_commands_if_enabled()
-        self._start_slack_home_refresh_if_enabled()
         app.add_handler(CommandHandler("start",  self.cmd_start))
         app.add_handler(CommandHandler("crew",   self.cmd_crew))
         app.add_handler(CommandHandler("load",   self.cmd_load))
         app.add_handler(CommandHandler("status", self.cmd_status))
         app.add_handler(CommandHandler("tasks",  self.cmd_tasks))
+        app.add_handler(CommandHandler("failed", self.cmd_failed))
         app.add_handler(CommandHandler("task",   self.cmd_task))
         app.add_handler(CommandHandler("memory", self.cmd_memory))
         app.add_handler(CommandHandler("reset",  self.cmd_reset))
@@ -554,6 +612,7 @@ class NexusCrewBot:
         app.add_handler(CommandHandler("doctor", self.cmd_doctor))
         app.add_handler(CommandHandler("handoff", self.cmd_handoff))
         app.add_handler(CommandHandler("skills", self.cmd_skills))
+        app.add_handler(CommandHandler("drill", self.cmd_drill))
         app.add_handler(CommandHandler("trace", self.cmd_trace))
         app.add_handler(CommandHandler("artifacts", self.cmd_artifacts))
         app.add_handler(CommandHandler("pr", self.cmd_pr))
@@ -680,11 +739,20 @@ class NexusCrewBot:
             "",
             status_table(self.registry.list_all()),
         ]
+        if self._startup_warnings:
+            lines.extend([
+                "",
+                "⚠️ Startup Warnings",
+                *[f"- {warning}" for warning in self._startup_warnings[-5:]],
+            ])
         if self._orch:
             if hasattr(self._orch, "format_status"):
                 lines.extend(["", self._orch.format_status(chat_id)])
             lines.extend(["", self._runner.format_status()])
         return "\n".join(lines)
+
+    def _record_startup_warning(self, component: str, err: Exception):
+        self._startup_warnings.append(f"{component}: {err}")
 
     def _start_dashboard_if_enabled(self):
         enabled = getattr(cfg, "DASHBOARD_ENABLED", False)
@@ -696,7 +764,11 @@ class NexusCrewBot:
             snapshot_provider=self._snapshot,
             detail_provider=self._dashboard_detail,
         )
-        self._dashboard.start()
+        try:
+            self._dashboard.start()
+        except OSError as err:
+            self._record_startup_warning("dashboard", err)
+            self._dashboard = None
 
     def _start_github_webhook_if_enabled(self):
         enabled = getattr(cfg, "GITHUB_WEBHOOK_ENABLED", False)
@@ -708,7 +780,11 @@ class NexusCrewBot:
             secret=getattr(cfg, "GITHUB_WEBHOOK_SECRET", ""),
             handler=self._handle_github_webhook_event,
         )
-        self._github_webhook.start()
+        try:
+            self._github_webhook.start()
+        except OSError as err:
+            self._record_startup_warning("github_webhook", err)
+            self._github_webhook = None
 
     def _handle_github_webhook_event(self, event_type: str, payload: dict, delivery_id: str):
         if self._orch is None:
@@ -734,7 +810,11 @@ class NexusCrewBot:
             signing_secret=getattr(cfg, "SLACK_SIGNING_SECRET", ""),
             handler=self._handle_slack_command,
         )
-        self._slack_commands.start()
+        try:
+            self._slack_commands.start()
+        except OSError as err:
+            self._record_startup_warning("slack_commands", err)
+            self._slack_commands = None
 
     def _handle_slack_command(self, form: dict) -> str:
         text = form.get("text", "").strip()
@@ -834,7 +914,34 @@ class NexusCrewBot:
                     pass
                 await asyncio.sleep(interval)
 
-        self._slack_home_refresh_task = asyncio.create_task(loop())
+        try:
+            self._slack_home_refresh_task = asyncio.create_task(loop())
+        except RuntimeError as err:
+            self._record_startup_warning("slack_app_home", err)
+            self._slack_home_refresh_task = None
+
+    def _start_task_watchdog_if_enabled(self):
+        if self._task_watchdog_task is not None:
+            return
+
+        async def loop():
+            while True:
+                try:
+                    if self._orch is not None:
+                        await self._orch.watchdog_tick(
+                            self._make_send,
+                            active_task_ids=self._runner.active_task_ids(),
+                            notify_chat=False,
+                        )
+                except Exception:
+                    pass
+                await asyncio.sleep(15)
+
+        try:
+            self._task_watchdog_task = asyncio.create_task(loop())
+        except RuntimeError as err:
+            self._record_startup_warning("task_watchdog", err)
+            self._task_watchdog_task = None
 
     def _dashboard_detail(self, path: str):
         if self._orch is None:

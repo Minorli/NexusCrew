@@ -1,6 +1,7 @@
 """Tests for runtime event log persistence and GitHub conversation mirroring."""
 import asyncio
 from pathlib import Path
+import urllib.error
 
 from nexuscrew.agents.base import AgentArtifacts, BaseAgent
 from nexuscrew.executor.shell import ShellExecutor
@@ -117,3 +118,56 @@ def test_github_sync_formats_issue_payload(monkeypatch):
     assert path == "/repos/owner/repo/issues"
     assert payload["labels"] == ["nexuscrew"]
     assert "Initial Request" in payload["body"]
+
+
+def test_github_sync_swallows_422_and_splits_large_comment(monkeypatch):
+    monkeypatch.setattr(github_sync_module.asyncio, "to_thread", _direct_to_thread)
+    captured: list[tuple[str, str, dict]] = []
+
+    class CaptureSync(GitHubConversationSync):
+        def _request(self, method: str, path: str, payload: dict) -> dict:
+            captured.append((method, path, payload))
+            if path.endswith("/issues"):
+                return {"number": 12, "html_url": "https://example/issues/12"}
+            if len(captured) == 2:
+                raise urllib.error.HTTPError(path, 422, "Unprocessable Entity", {}, None)
+            return {"id": len(captured)}
+
+    class Task:
+        id = "T-0001"
+        description = "修复缓存"
+        status = type("Status", (), {"value": "planning"})()
+        assigned_to = "alice"
+        github_issue_number = 0
+        github_issue_url = ""
+
+    sync = CaptureSync("owner/repo", "token")
+    large_body = "x" * (GitHubConversationSync.COMMENT_BODY_LIMIT + 10)
+
+    asyncio.run(sync.mirror_comment(Task(), "alice", large_body))
+
+    assert captured[0][1].endswith("/issues")
+    assert captured[1][1].endswith("/comments")
+
+
+def test_github_sync_swallows_network_timeout(monkeypatch):
+    monkeypatch.setattr(github_sync_module.asyncio, "to_thread", _direct_to_thread)
+
+    class CaptureSync(GitHubConversationSync):
+        def _create_issue(self, task, initial_message: str) -> dict:
+            raise urllib.error.URLError("handshake timeout")
+
+    class Task:
+        id = "T-0001"
+        description = "修复缓存"
+        status = type("Status", (), {"value": "planning"})()
+        assigned_to = "alice"
+        github_issue_number = 0
+        github_issue_url = ""
+
+    task = Task()
+    sync = CaptureSync("owner/repo", "token")
+
+    asyncio.run(sync.ensure_task_issue(task, initial_message="hello"))
+
+    assert task.github_issue_number == 0

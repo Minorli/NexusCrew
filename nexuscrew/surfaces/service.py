@@ -1,8 +1,15 @@
 """Shared command service for Telegram / Slack surfaces."""
 
+from datetime import datetime
+import re
+
 
 class ChatOpsService:
     """Surface-agnostic command layer."""
+    FOLLOW_UP_HINTS = (
+        "然后", "进度", "在吗", "还在", "继续", "没回复", "没有进度",
+        "又没有", "很久", "怎么还", "卡住", "更新", "看下",
+    )
 
     def __init__(self, registry, orchestrator, runner, executor, skills,
                  board_getter, board_updater, crew_memory=None):
@@ -26,6 +33,9 @@ class ChatOpsService:
 
     def tasks_text(self) -> str:
         return self.runner.format_status()
+
+    def failed_text(self) -> str:
+        return self.runner.format_failed()
 
     def task_text(self, chat_id: int, task_id: str) -> str:
         if not self.orchestrator:
@@ -169,12 +179,54 @@ class ChatOpsService:
     def submit_message(self, chat_id: int, message: str, send) -> str:
         if not self.orchestrator:
             return ""
-        task = self.orchestrator.task_tracker.create(chat_id, message)
+        router = getattr(self.orchestrator, "router", None)
+        initial_agent = None
+        if router is not None:
+            initial_agent = router.detect_first(message) or router.default_agent()
+        task = None
+        explicit_task_id = self._extract_task_id(message)
+        if explicit_task_id:
+            task = self.orchestrator.task_tracker.get(chat_id, explicit_task_id)
+        if initial_agent is not None:
+            if task is None and self._looks_like_follow_up(message):
+                task = self.orchestrator.task_tracker.latest_active_for_assignee(
+                    chat_id,
+                    initial_agent.name,
+                )
+        if task is None:
+            task = self.orchestrator.task_tracker.create(chat_id, message)
+        else:
+            task.history.append(
+                f"human_follow_up at {datetime.now().isoformat()}: {message[:200]}"
+            )
+            self.orchestrator.state_store.save_task(chat_id, task)
         run_id = self.orchestrator._new_run_id()
+
+        async def notify_failure(job, err):
+            await send(f"⚠️ 后台任务 {job.id} 执行失败：{err}")
+
+        async def notify_heartbeat(job):
+            current = self.orchestrator.task_tracker.get(chat_id, task.id) or task
+            assignee = f"@{current.assigned_to}" if current.assigned_to else "@未分配"
+            await send(
+                f"⏳ 任务 {current.id} 仍在处理中：{assignee} 正在执行，"
+                f"当前状态 `{current.status.value}`。"
+            )
+
         return self.runner.submit(
             message,
             self.orchestrator.run_chain(message, chat_id, send, run_id=run_id, task=task),
             chat_id=chat_id,
             task_id=task.id,
             run_id=run_id,
+            on_error=notify_failure,
+            on_heartbeat=notify_heartbeat,
         )
+
+    def _extract_task_id(self, message: str) -> str | None:
+        match = re.search(r"\bT-\d{4}\b", message)
+        return match.group(0) if match else None
+
+    def _looks_like_follow_up(self, message: str) -> bool:
+        lowered = message.lower()
+        return any(hint in lowered for hint in self.FOLLOW_UP_HINTS)

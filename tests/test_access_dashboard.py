@@ -2,6 +2,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from nexuscrew.telegram import bot as bot_module
 from nexuscrew.policy.access import AccessController
 from nexuscrew.telegram.bot import NexusCrewBot
 
@@ -75,3 +76,43 @@ def test_dashboard_snapshot_contains_tasks_and_approvals():
     assert snapshot["tasks"][0]["id"] == "T-0001"
     assert snapshot["approvals"][0]["id"] == "APR-0001"
     assert snapshot["background_runs"][0]["id"] == "BG-0001"
+
+
+def test_build_app_ignores_dashboard_start_failure(monkeypatch):
+    class FakeBuilder:
+        def token(self, value):
+            return self
+
+        def post_init(self, callback):
+            return self
+
+        def build(self):
+            return SimpleNamespace(add_handler=lambda handler: None)
+
+    class FakePool:
+        def __init__(self, token):
+            self.token = token
+
+    bot = NexusCrewBot()
+
+    monkeypatch.setattr(bot_module, "ApplicationBuilder", lambda: FakeBuilder())
+    monkeypatch.setattr(bot_module, "AgentBotPool", FakePool)
+    monkeypatch.setattr(bot_module.cfg, "DASHBOARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(bot_module.cfg, "GITHUB_WEBHOOK_ENABLED", False, raising=False)
+    monkeypatch.setattr(bot_module.cfg, "SLACK_COMMANDS_ENABLED", False, raising=False)
+    monkeypatch.setattr(bot_module.cfg, "SLACK_APP_HOME_REFRESH_SECONDS", 0, raising=False)
+
+    class BrokenDashboard:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(bot_module, "DashboardServer", BrokenDashboard)
+
+    app = bot.build_app()
+
+    assert app is not None
+    assert bot._dashboard is None
+    assert any("dashboard" in warning for warning in bot._startup_warnings)

@@ -75,8 +75,9 @@ In practice, NexusCrew behaves more like a small autonomous engineering organiza
 
 ```bash
 pip install anthropic openai python-telegram-bot pyyaml
-gemini auth login
 ```
+
+If you explicitly want Gemini CLI as an optional backend later, run `gemini auth login`.
 
 ### 2. Configure
 
@@ -86,13 +87,21 @@ Recommended: start the local setup wizard.
 python3 -m nexuscrew setup
 ```
 
-Then open the local URL and complete:
+The wizard binds to `0.0.0.0` by default and will print both `127.0.0.1` and detected LAN IP URLs.
+
+Then open the printed URL and complete:
 
 - Telegram
 - model credentials
 - GitHub / Slack integrations
 - default crew
 - validation and launch
+
+The setup UI can also configure:
+
+- dedicated per-agent Telegram bots
+- bot username to agent-name mapping
+- dashboard / webhook / recovery controls
 
 If you prefer manual setup, you can still create local-only files from:
 

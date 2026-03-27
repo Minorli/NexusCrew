@@ -2,6 +2,7 @@
 import re
 from .registry import AgentRegistry
 from .agents.base import BaseAgent
+from .local_secrets import load_local_secrets
 
 # Role aliases: these map common @mentions to canonical role names
 ROLE_ALIASES: dict[str, str] = {
@@ -15,6 +16,7 @@ ROLE_ALIASES: dict[str, str] = {
 }
 
 _MENTION_RE = re.compile(r"@(\w+)")
+cfg = load_local_secrets()
 
 
 class Router:
@@ -50,6 +52,12 @@ class Router:
         agent = self.registry.get_by_name(tl)
         if agent:
             return agent
+        # 1.5. Dedicated bot username match
+        mapped_name = getattr(cfg, "BOT_USERNAME_MAP", {}).get(tl)
+        if mapped_name:
+            agent = self.registry.get_by_name(mapped_name.lower())
+            if agent:
+                return agent
         # 2. Role alias
         role = ROLE_ALIASES.get(tl)
         if role:

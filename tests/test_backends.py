@@ -134,3 +134,52 @@ def test_anthropic_backend_returns_error_string_for_client_error(monkeypatch):
 
     assert result.startswith("[Anthropic API Error after 3 retries]")
     assert "invalid key" in result
+
+
+def test_anthropic_backend_degrades_on_403(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.messages = SimpleNamespace(create=self.create)
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs.get("thinking"):
+                raise FakeAnthropicAPIError("forbidden", status_code=403)
+            if kwargs.get("model") == "light-model":
+                return _anthropic_response("ok-light")
+            return _anthropic_response("ok")
+
+    monkeypatch.setattr(anthropic_backend.anthropic, "Anthropic", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(anthropic_backend.anthropic, "RateLimitError", FakeAnthropicRateLimitError)
+    monkeypatch.setattr(anthropic_backend.anthropic, "APITimeoutError", FakeAnthropicAPITimeoutError)
+    monkeypatch.setattr(anthropic_backend.anthropic, "APIError", FakeAnthropicAPIError)
+
+    backend = AnthropicBackend("key", "claude-opus-4-6", model_light="light-model")
+    result = backend.complete("system", [{"role": "user", "content": "hi"}], use_thinking=True)
+
+    assert result == "ok"
+    assert backend._client.calls[0]["thinking"]["type"] == "enabled"
+    assert "thinking" not in backend._client.calls[1]
+
+
+def test_anthropic_backend_strips_thinking_blocks(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.messages = SimpleNamespace(create=self.create)
+
+        def create(self, **kwargs):
+            return SimpleNamespace(content=[
+                SimpleNamespace(type="thinking", text="secret"),
+                SimpleNamespace(type="text", text="visible"),
+            ])
+
+    monkeypatch.setattr(anthropic_backend.anthropic, "Anthropic", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(anthropic_backend.anthropic, "RateLimitError", FakeAnthropicRateLimitError)
+    monkeypatch.setattr(anthropic_backend.anthropic, "APITimeoutError", FakeAnthropicAPITimeoutError)
+    monkeypatch.setattr(anthropic_backend.anthropic, "APIError", FakeAnthropicAPIError)
+
+    backend = AnthropicBackend("key", "model")
+    result = backend.complete("system", [{"role": "user", "content": "hi"}])
+
+    assert result == "visible"

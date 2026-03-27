@@ -1,4 +1,5 @@
 """Tests for dispatcher bot pool and send routing."""
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,9 +110,37 @@ async def test_orchestrator_sends_agent_messages_with_agent_name(tmp_path: Path)
 
     await orchestrator.run_chain("@alice 开始", 1, send)
 
-    assert sent[0][1] is None
-    assert sent[1][1] == "alice"
-    assert sent[1][0].startswith("**[alice]**")
+    assert sent[0][1] == "alice"
+    assert sent[0][0].startswith("**[alice]**")
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_fans_out_to_multiple_mentioned_agents(tmp_path: Path, monkeypatch):
+    registry = AgentRegistry()
+    registry.register(FakeAgent("alice", "pm", "@bob 跑测试\n@dave 做评审"))
+    registry.register(FakeAgent("bob", "dev", "dev done"))
+    registry.register(FakeAgent("dave", "architect", "arch done"))
+    executor = ShellExecutor(tmp_path)
+    monkeypatch.setattr(executor, "git_current_branch", lambda: asyncio.sleep(0, result="main"))
+    monkeypatch.setattr(executor, "git_create_branch", lambda branch_name: asyncio.sleep(0, result="ok"))
+    monkeypatch.setattr(executor, "git_changed_files", lambda limit=8: asyncio.sleep(0, result=[]))
+    orchestrator = Orchestrator(
+        registry,
+        Router(registry),
+        CrewMemory(tmp_path / "crew_memory.md"),
+        executor,
+    )
+
+    sent: list[tuple[str, str | None]] = []
+
+    async def send(text: str, agent_name: str | None = None):
+        sent.append((text, agent_name))
+
+    await orchestrator.run_chain("@alice 开始", 1, send)
+
+    agent_names = [agent_name for _, agent_name in sent if agent_name]
+    assert "bob" in agent_names
+    assert "dave" in agent_names
 
 
 @pytest.mark.asyncio
