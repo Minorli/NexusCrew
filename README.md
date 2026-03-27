@@ -1,185 +1,70 @@
 # NexusCrew
 
-NexusCrew is a Telegram-native multi-agent software delivery runtime.
+NexusCrew is a Telegram-native multi-agent software delivery runtime.  
+NexusCrew 是一个以 Telegram 群组为主控制面的多 Agent 软件交付运行时。
 
-It turns a Telegram group into a real operating room for software work:
+## Docs / 文档
 
-- PM agents decompose requests
-- Dev agents execute code and shell actions
-- Architect agents review for correctness and safety
-- HR agents track quality, trends, and execution health
-- task activity is mirrored into GitHub issues and PR workflow artifacts
+- English: [README.en.md](README.en.md)
+- 中文: [README.zh-CN.md](README.zh-CN.md)
+- Telegram setup: [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md)
+- Example crew config: [crew.example.yaml](crew.example.yaml)
+- Example secrets template: [secrets.example.py](secrets.example.py)
 
-## Why It Feels Different
+## Quick Summary / 快速概览
 
-Most coding agents operate as a single assistant inside an editor.
-NexusCrew is built around visible team collaboration:
+NexusCrew turns a Telegram group into a visible engineering team:
+- PM plans and decomposes work
+- Dev agents implement and validate changes
+- Architect reviews for correctness and risk
+- HR tracks delivery quality and team health
+- GitHub keeps the durable issue / PR / review record
 
-- real multi-bot identity model in Telegram
-- asynchronous background task execution
-- task state tracking, pause/resume/replay
-- risk-aware approvals for high-risk shell actions
-- GitHub issue/comment mirroring for durable communication
-- event log, checkpoints, artifacts, and trace timeline
+NexusCrew 把 Telegram 群组变成一个可见的软件工程团队：
+- PM 负责拆需求、排优先级、做验收
+- Dev 负责写代码、跑命令、补测试
+- Architect 负责审查和风险判断
+- HR 负责团队健康和绩效观察
+- GitHub 负责长期工程留痕
 
-The goal is not just "generate code", but "run a governable software delivery process".
+## Start / 启动
 
-## Core Capabilities
-
-### Multi-Agent Team Runtime
-
-- Heterogeneous roles: PM, Dev, Architect, HR
-- Dynamic crew initialization from command line or YAML
-- Multi-bot dispatcher with single-bot fallback
-- Role routing and explicit `@mention` handoff
-
-### Delivery Workflow
-
-- Task tracker with lifecycle states
-- Automatic branch session support
-- PR draft generation hooks
-- CI status ingestion hooks
-- Merge-gate summaries
-
-### Operational Control
-
-- Background jobs for long-running work
-- `/pause`, `/resume`, `/replay`
-- `/tasks`, `/task`, `/cancel`
-- `/approvals`, `/approve`, `/reject`
-- `/doctor` for system health and HR-oriented diagnostics
-
-### Traceability
-
-- Append-only runtime event log
-- Checkpoint persistence
-- Artifact store
-- Scoped memory and retrieval
-- GitHub issue/comment mirroring
-
-## Architecture Snapshot
-
-```text
-Telegram Group
-    -> Dispatcher Bot Layer
-    -> Orchestrator
-    -> PM / Dev / Architect / HR Agents
-    -> Shell / Git / GitHub / Memory / Metrics / Trace
-```
-
-In practice, NexusCrew behaves more like a small autonomous engineering organization than a plain chatbot.
-
-## Quick Start
-
-### 1. Install
-
-```bash
-pip install anthropic openai python-telegram-bot pyyaml
-```
-
-If you explicitly want Gemini CLI as an optional backend later, run `gemini auth login`.
-
-### 2. Configure
-
-Recommended: start the local setup wizard.
+Recommended first-run setup:
 
 ```bash
 python3 -m nexuscrew setup
 ```
 
-The wizard binds to `0.0.0.0` by default and will print both `127.0.0.1` and detected LAN IP URLs.
-
-Then open the printed URL and complete:
-
-- Telegram
-- model credentials
-- GitHub / Slack integrations
-- default crew
-- validation and launch
-
-The setup UI can also configure:
-
-- dedicated per-agent Telegram bots
-- bot username to agent-name mapping
-- dashboard / webhook / recovery controls
-
-If you prefer manual setup, you can still create local-only files from:
-
-- `secrets.example.py`
-- `crew.example.yaml`
-
-### 3. Run
+Normal start:
 
 ```bash
 python3 -m nexuscrew
 ```
 
-If `secrets.py` is missing or invalid, NexusCrew will automatically start the local setup wizard instead of failing immediately.
+Core Telegram commands:
+- `/start`
+- `/load crew.local.yaml`
+- `/status`
+- `/tasks`
+- `/failed`
+- `/doctor`
+- `/drill`
 
-You can still preload a specific crew configuration manually:
+## Design Intent / 设计目标
 
-```bash
-python3 -m nexuscrew start -c crew.example.yaml
-```
+NexusCrew is optimized for:
+- live team-style collaboration in Telegram
+- durable engineering records in GitHub
+- recoverable runtime state
+- background execution without silent stalls
+- concise, professional delivery communication instead of terminal spam
 
-### 4. Start a Crew in Telegram
-
-```text
-/crew ~/myproject pm:alice dev:bob dev:charlie architect:dave hr:carol
-@alice Add JWT authentication for the user service
-```
-
-## Key Commands
-
-| Command | Purpose |
-|---|---|
-| `/crew <path> [agents]` | Create a runtime crew from inline spec |
-| `/load <crew.yaml>` | Load a crew from YAML |
-| `/status` | Show agents, task board, and background jobs |
-| `/tasks` | Show background runs |
-| `/task <task_id>` | Show one task with GitHub / trace / artifact context |
-| `/pause <task_id>` | Pause a task at the next safe boundary |
-| `/resume <task_id>` | Resume from latest checkpoint |
-| `/replay <task_id>` | Replay a task run |
-| `/approvals` | List pending risky actions |
-| `/approve <id>` | Approve and execute a gated action |
-| `/reject <id>` | Reject a gated action |
-| `/doctor` | Show system, task, and HR-oriented health summary |
-| `/skills` | Show built-in workflow skills |
-
-## GitHub Conversation Mirror
-
-When GitHub sync is enabled, NexusCrew can keep the durable engineering conversation in GitHub as well:
-
-- each tracked task can open or attach to a GitHub issue
-- human requests are mirrored as issue comments
-- agent replies and shell summaries are mirrored as comments
-- PR draft and review workflow can be layered on top of the same task context
-
-This means Telegram remains the live command surface, while GitHub keeps the durable written record.
-
-## Security Model
-
-- `secrets.py` is local-only and gitignored
-- risky shell actions are gated behind approval requests
-- runtime state and internal design files can remain local-only
-- recommended deployment target is a dedicated, controlled machine
-
-## Repository Layout
-
-Public repository contents are intended to emphasize:
-
-- source code
-- tests
-- public-facing usage docs
-
-Internal planning notes, private prompts, local runtime state, and local-only design artifacts are intentionally kept out of Git history.
-
-## Public Docs
-
-- [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md)
-- [crew.example.yaml](crew.example.yaml)
-- [secrets.example.py](secrets.example.py)
+NexusCrew 强调：
+- 在 Telegram 里像团队一样协作
+- 在 GitHub 里留下长期工程记录
+- 运行时可恢复、可审计
+- 后台任务不静默卡死
+- 群里只看摘要，不看大段终端垃圾输出
 
 ## License
 
