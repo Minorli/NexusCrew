@@ -55,6 +55,7 @@ def _default_model(role: str) -> str:
         "dev": "codex",
         "architect": "claude",
         "hr": "claude",
+        "qa": "claude",
     }.get(role, "claude")
 
 
@@ -683,9 +684,9 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
             "Dev 2",
             "Architect",
             "HR",
+            "QA",
             "Extra 1",
             "Extra 2",
-            "Extra 3",
         ]
         for idx, label in enumerate(placeholders, start=1):
             rows.append(
@@ -836,7 +837,7 @@ def render_setup_html(message: str = "", launch_ready: bool = False,
               <div class="grid">
                 <div class="field"><label>Project Directory</label><input name="project_dir" value="{val('project_dir')}" placeholder="~/myproject"></div>
                 <div class="field"><label>Project Prefix</label><input name="project_prefix" value="{val('project_prefix', 'nexus')}"></div>
-                <div class="field"><label>Agent Specs</label><textarea name="agent_specs">{html.escape(defaults.get('agent_specs', 'pm:nexus-pm-01(claude)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(claude)'))}</textarea></div>
+                <div class="field"><label>Agent Specs</label><textarea name="agent_specs">{html.escape(defaults.get('agent_specs', 'pm:nexus-pm-01(claude)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(claude)\nqa:nexus-qa-01(claude)'))}</textarea></div>
                 <div class="field"><label>Max Chain Hops</label><input name="max_chain_hops" value="{val('max_chain_hops', '10')}"></div>
                 <div class="field"><label>Max Dev Retry</label><input name="max_dev_retry" value="{val('max_dev_retry', '5')}"></div>
                 <div class="field"><label>History Window</label><input name="history_window" value="{val('history_window', '20')}"></div>

@@ -22,6 +22,7 @@ from ..agents.pm import PMAgent
 from ..agents.dev import DevAgent
 from ..agents.architect import ArchitectAgent
 from ..agents.hr import HRAgent
+from ..agents.qa import QAAgent
 from ..backends.gemini_cli import GeminiCLIBackend
 from ..backends.openai_backend import OpenAIBackend
 from ..backends.anthropic_backend import AnthropicBackend
@@ -50,6 +51,7 @@ MODEL_DEFAULTS = {
     "dev": "codex",
     "architect": "claude",
     "hr": "claude",
+    "qa": "claude",
 }
 
 
@@ -89,6 +91,8 @@ def _make_agent(role: str, name: str, model: str, executor: ShellExecutor,
         return ArchitectAgent(name, backend, extra)
     if role == "hr":
         return HRAgent(name, backend, extra, model_label=model)
+    if role == "qa":
+        return QAAgent(name, backend, executor, extra, model_label=model)
     raise ValueError(f"Unknown role: {role}")
 
 

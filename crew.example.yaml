@@ -58,6 +58,18 @@ agents:
       使用阿里 361 绩效体系（3.25/3.5/3.75）进行评分。
       督促消息需 @目标Agent 并抄送 @PM，重大问题 @Human。
 
+  # ── QA Agent（测试架构师 / 质量闸门）──────────────────────────────
+  # 走 Anthropic 线路，负责测试设计、质量闸门、发布前验证
+  - role: qa
+    name: nexus-qa-01
+    model: claude
+    anthropic_model: claude-opus-4-6
+    anthropic_model_light: claude-sonnet-4-6
+    system_prompt_extra: |
+      你负责质量闸门，不对“看起来能用”放行。
+      你要覆盖：功能测试、边界条件、回归风险、发布前 smoke test、回滚风险。
+      默认输出 Go / No-Go、覆盖项、风险项、下一步负责人。
+
 orchestrator:
   max_chain_hops: 10
   max_dev_retry: 5

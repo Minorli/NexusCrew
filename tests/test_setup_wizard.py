@@ -35,7 +35,7 @@ def test_setup_wizard_builds_secrets_and_crew(tmp_path: Path):
         "anthropic_api_key": "sk-ant-test",
         "project_dir": "/tmp/project",
         "project_prefix": "nexus",
-        "agent_specs": "pm:nexus-pm-01(claude)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(claude)",
+        "agent_specs": "pm:nexus-pm-01(claude)\ndev:nexus-dev-01(codex)\narchitect:nexus-arch-01(claude)\nhr:nexus-hr-01(claude)\nqa:nexus-qa-01(claude)",
     }
 
     secrets_text = build_secrets_py(form)
@@ -120,6 +120,16 @@ def test_validate_setup_allows_blank_gemini_when_unused(tmp_path: Path):
     )
 
     assert not any("GEMINI_CLI_CMD" in issue for issue in issues)
+
+
+def test_build_crew_local_yaml_keeps_qa_as_claude():
+    crew_yaml = build_crew_local_yaml({
+        "project_dir": "/tmp/project",
+        "agent_specs": "qa:nexus-qa-01",
+    })
+
+    assert "role: qa" in crew_yaml
+    assert "model: claude" in crew_yaml
 
 
 def test_launch_nexuscrew_uses_local_yaml_when_present(tmp_path: Path, monkeypatch):
@@ -234,6 +244,7 @@ def test_render_setup_html_includes_stepper_and_checks():
     assert "连接测试结果" in html
     assert "123:abc" in html
     assert "运行状态" in html
+    assert "qa:nexus-qa-01(claude)" in html
 
 
 def test_render_success_and_console_html(tmp_path: Path):

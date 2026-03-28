@@ -12,6 +12,8 @@ AGENT_BOT_TOKENS: dict[str, str] = {
     # "nexus-dev-01":  "7xxx:BBB...",
     # "nexus-dev-02":  "7xxx:CCC...",
     # "nexus-arch-01": "7xxx:DDD...",
+    # "nexus-hr-01":   "7xxx:EEE...",
+    # "nexus-qa-01":   "7xxx:FFF...",
 }
 # Bot @username → Agent 名字映射
 BOT_USERNAME_MAP: dict[str, str] = {
@@ -19,6 +21,8 @@ BOT_USERNAME_MAP: dict[str, str] = {
     # "nexus_dev_01_bot":  "nexus-dev-01",
     # "nexus_dev_02_bot":  "nexus-dev-02",
     # "nexus_arch_01_bot": "nexus-arch-01",
+    # "nexus_hr_01_bot":   "nexus-hr-01",
+    # "nexus_qa_01_bot":   "nexus-qa-01",
 }
 
 # ── OpenAI / Codex  (Dev Agent: nexus-dev-XX) ──────────────────────

@@ -38,6 +38,10 @@ class TestDetectFirst:
         router = _setup(_agent("nexus-hr-01", "hr"))
         assert router.detect_first("@hr 出绩效报告").name == "nexus-hr-01"
 
+    def test_role_alias_qa(self):
+        router = _setup(_agent("nexus-qa-01", "qa"))
+        assert router.detect_first("@qa 做回归测试").name == "nexus-qa-01"
+
     def test_no_mention_returns_none(self):
         router = _setup(_agent("alice", "pm"))
         assert router.detect_first("没有 mention 的消息") is None
@@ -66,6 +70,16 @@ class TestDetectFirst:
         )
         router = _setup(_agent("nexus-dev-02", "dev"), _agent("alice", "pm"))
         assert router.detect_first("@nexus_dev_02_bot 你呢").name == "nexus-dev-02"
+
+    def test_qa_bot_username_maps_to_agent_name(self, monkeypatch):
+        monkeypatch.setattr(
+            router_module.cfg,
+            "BOT_USERNAME_MAP",
+            {"nexus_qa_01_bot": "nexus-qa-01"},
+            raising=False,
+        )
+        router = _setup(_agent("nexus-qa-01", "qa"), _agent("alice", "pm"))
+        assert router.detect_first("@nexus_qa_01_bot 做一轮验收").name == "nexus-qa-01"
 
 
 class TestDetectAll:

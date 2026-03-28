@@ -19,14 +19,17 @@ TOP_TIER_PROPOSAL.md
 ENTERPRISE_PROPOSAL.md
 crew.local.yaml
 crew_memory.md
+crew_memory.db
 artifacts.jsonl
 branch_sessions.jsonl
 run_checkpoints.jsonl
 run_events.jsonl
 scoped_memory.jsonl
+scoped_memory.db
 metrics_history.jsonl
 .nexus_audit.jsonl
 .nexuscrew_state.db
+.nexuscrew_drill_memory.db
 .nexus_launch.json
 
 local_secrets.py
