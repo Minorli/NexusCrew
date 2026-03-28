@@ -15,10 +15,25 @@ def test_load_crew_config_parses_example_yaml():
     assert config.project_dir == Path("~/myproject").expanduser()
     assert config.project_prefix == "nexus"
     assert [agent.role for agent in config.agents] == [
-        "pm", "dev", "dev", "architect", "hr",
+        "pm", "dev", "dev", "architect", "hr", "qa",
     ]
     assert config.orchestrator.max_chain_hops == 10
     assert config.hr.anomaly_triggers["dev_retry_threshold"] == 3
+
+
+def test_make_agent_supports_qa_role(monkeypatch, tmp_path: Path):
+    from nexuscrew.agents.qa import QAAgent
+    from nexuscrew.executor.shell import ShellExecutor
+
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_API_KEY", "sk-ant-test", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_BASE_URL", "https://anth.example.com/", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_MODEL", "claude-opus-4-6", raising=False)
+    monkeypatch.setattr(bot_module.cfg, "ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6", raising=False)
+
+    agent = bot_module._make_agent("qa", "nexus-qa-01", "claude", ShellExecutor(tmp_path))
+
+    assert isinstance(agent, QAAgent)
+    assert agent.role == "qa"
 
 
 def test_load_crew_config_requires_project_dir(tmp_path: Path):

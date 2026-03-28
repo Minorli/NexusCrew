@@ -13,6 +13,9 @@ ROLE_ALIASES: dict[str, str] = {
     "architect": "architect",
     "arch": "architect",
     "hr": "hr",  # Task 1.2 完成: 支持 HR 角色别名路由。
+    "qa": "qa",
+    "test": "qa",
+    "tester": "qa",
 }
 
 _MENTION_RE = re.compile(r"@(\w+)")

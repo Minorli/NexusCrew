@@ -522,6 +522,12 @@ class Orchestrator:
                 "lgtm", "缺陷", "打回",
             )
             return any(keyword in lowered for keyword in keywords)
+        if agent.role == "qa":
+            keywords = (
+                "测试", "验收", "质量", "回归", "发布", "smoke", "go", "no-go",
+                "风险", "验证", "覆盖", "用例", "检查",
+            )
+            return any(keyword in lowered for keyword in keywords)
         return False
 
     def _is_low_signal_reply(self, agent, reply: str, artifacts) -> bool:
@@ -556,6 +562,25 @@ class Orchestrator:
                 return True
             substantive_markers = ("LGTM", "打回", "缺陷", "风险", "需改进", "需重构", "结论")
             return not any(marker in text for marker in substantive_markers)
+        if agent.role == "qa":
+            if getattr(artifacts, "shell_output", ""):
+                return False
+            if "@" in text and any(fragment in text for fragment in ("Go", "No-Go", "NO-GO", "阻断", "修复", "回归")):
+                return False
+            progress_fragments = (
+                "在测", "测试中", "稍后给结论", "稍后同步", "先看一下", "先跑一下",
+                "正在验证", "结果随后", "回头给结论",
+            )
+            if any(fragment in text for fragment in progress_fragments):
+                return True
+            low_signal_replies = (
+                "ok", "收到", "在", "收到，先测一下", "收到，稍后给结论",
+                "收到，先验证一下", "收到，测试中。",
+            )
+            if normalized in low_signal_replies or len(text) < 120:
+                return True
+            substantive_markers = ("Go", "No-Go", "NO-GO", "风险", "覆盖", "验证", "阻断", "结论")
+            return not any(marker in text for marker in substantive_markers)
         return False
 
     def _build_substantive_retry_prompt(self, agent, message: str, reply: str) -> str:
@@ -572,6 +597,13 @@ class Orchestrator:
                 f"你刚才的回复是：{reply}\n\n"
                 "这不是有效评审。请直接给出评审结论："
                 "LGTM，或列出具体缺陷并 @具体负责人。不要只确认收到。"
+            )
+        if agent.role == "qa":
+            return (
+                f"{message}\n\n"
+                f"你刚才的回复是：{reply}\n\n"
+                "这不是有效测试结论。请直接给出 Go / No-Go、覆盖项、风险项，"
+                "或者直接执行最小必要的验证命令并汇报结果。不要只汇报状态。"
             )
         return message
 
@@ -638,6 +670,11 @@ class Orchestrator:
             if pm:
                 return f"⚠️ @{agent.name} 在任务 {task_id} 上评审超时。@{pm.name} 请调整计划或改派。"
             return f"⚠️ @{agent.name} 在任务 {task_id} 上评审超时，请人工介入。"
+        if agent.role == "qa":
+            pm = self.router.default_agent()
+            if pm:
+                return f"⚠️ @{agent.name} 在任务 {task_id} 上测试验证超时。@{pm.name} 请调整计划或改派。"
+            return f"⚠️ @{agent.name} 在任务 {task_id} 上测试验证超时，请人工介入。"
         if agent.role == "pm":
             return f"⚠️ @{agent.name} 在任务 {task_id} 上编排超时，请人工介入。"
         return f"⚠️ @{agent.name} 在任务 {task_id} 上响应超时，请人工介入。"
@@ -654,6 +691,11 @@ class Orchestrator:
             if pm:
                 return f"⚠️ @{agent.name} 未给出有效评审结论。@{pm.name} 请调整计划或改派（task {task_id}）。"
             return f"⚠️ @{agent.name} 未给出有效评审结论，请人工介入（task {task_id}）。"
+        if agent.role == "qa":
+            pm = self.router.default_agent()
+            if pm:
+                return f"⚠️ @{agent.name} 未给出有效测试结论。@{pm.name} 请调整计划或改派（task {task_id}）。"
+            return f"⚠️ @{agent.name} 未给出有效测试结论，请人工介入（task {task_id}）。"
         if agent.role == "pm":
             return f"⚠️ @{agent.name} 未给出有效编排结果，请人工介入（task {task_id}）。"
         return f"⚠️ @{agent.name} 未给出有效结果，请人工介入（task {task_id}）。"

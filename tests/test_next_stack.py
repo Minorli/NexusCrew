@@ -101,6 +101,21 @@ def test_scoped_memory_retriever(tmp_path: Path):
     assert "对 bob 的提醒" in retrieved
 
 
+def test_scoped_memory_store_imports_legacy_jsonl(tmp_path: Path):
+    legacy = tmp_path / "scoped_memory.jsonl"
+    legacy.write_text(
+        '{"scope":"shared","actor":"human","content":"旧上下文","importance":2,"ts":"2026-03-28T10:00:00"}\n',
+        encoding="utf-8",
+    )
+
+    store = ScopedMemoryStore(legacy)
+
+    entries = store.read("shared", last_n=5)
+
+    assert [item.content for item in entries] == ["旧上下文"]
+    assert legacy.with_suffix(".db").exists()
+
+
 def test_trace_store_and_stuck_detector(tmp_path: Path):
     store = EventStore(tmp_path / "events.jsonl")
     store.append(RunEvent(run_id="run-1", chat_id=1, task_id="T-0001", type="shell_finished", actor="bob", payload={"output": "failed"}))

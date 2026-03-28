@@ -116,6 +116,39 @@ def test_orchestrator_escalates_when_architect_stays_low_signal_twice(tmp_path: 
     assert any("@alice" in text for text in sent)
 
 
+def test_orchestrator_escalates_when_qa_stays_low_signal_twice(tmp_path: Path):
+    registry = AgentRegistry()
+    registry.register(SequencedAgent(
+        "alice",
+        "pm",
+        ["收到，我来调整计划。"],
+    ))
+    registry.register(SequencedAgent(
+        "qa-1",
+        "qa",
+        [
+            "在测，稍后给结论。",
+            "先跑一下，结果随后。",
+        ],
+    ))
+    orchestrator = Orchestrator(
+        registry,
+        Router(registry),
+        CrewMemory(tmp_path / "crew_memory.md"),
+        ShellExecutor(tmp_path),
+    )
+
+    sent: list[str] = []
+
+    async def send(text: str, agent_name: str | None = None):
+        sent.append(text)
+
+    asyncio.run(orchestrator.run_chain("@qa-1 请做回归测试并给 Go / No-Go", 1, send))
+
+    assert any("未给出有效测试结论" in text for text in sent)
+    assert any("@alice" in text for text in sent)
+
+
 def test_orchestrator_watchdog_reports_and_times_out(tmp_path: Path):
     class SlowAgent(BaseAgent):
         def __init__(self, name: str, role: str):
