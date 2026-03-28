@@ -11,6 +11,7 @@ class BranchSession:
     task_id: str
     branch_name: str
     base_branch: str = "unknown"
+    baseline_dirty_files: dict[str, str] = field(default_factory=dict)
     pr_number: int = 0
     pr_url: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())

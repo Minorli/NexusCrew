@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import re
 
+SUPPORTED_BACKENDS = {"openai", "claude", "codex", "shell", "dummy"}
+
 
 def _validate_positive_int(name: str, value: object) -> int:
     try:
@@ -14,6 +16,42 @@ def _validate_positive_int(name: str, value: object) -> int:
         raise ValueError(f"{name} must be a positive integer")
     return ivalue
 
+
+
+def _validate_agents(raw_agents: object) -> list[dict]:
+    if raw_agents is None:
+        raise ValueError("crew.local.yaml missing required 'agents' field")
+    if not isinstance(raw_agents, list):
+        raise ValueError("'agents' must be a list")
+
+    seen_names: set[str] = set()
+    validated: list[dict] = []
+    for index, agent in enumerate(raw_agents):
+        if not isinstance(agent, dict):
+            raise ValueError(f"agent at index {index} must be a mapping")
+
+        name = str(agent.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"agent at index {index} missing required 'name'")
+        if name in seen_names:
+            raise ValueError(f"duplicate agent name: {name}")
+        seen_names.add(name)
+
+        role = str(agent.get("role") or "").strip()
+        if not role:
+            raise ValueError(f"agent '{name}' missing required 'role'")
+
+        backend = str(agent.get("backend") or "").strip()
+        if not backend:
+            raise ValueError(f"agent '{name}' missing required 'backend'")
+        if backend not in SUPPORTED_BACKENDS:
+            supported = ", ".join(sorted(SUPPORTED_BACKENDS))
+            raise ValueError(
+                f"agent '{name}' has unsupported backend '{backend}'; supported: {supported}"
+            )
+
+        validated.append(agent)
+    return validated
 import yaml
 
 

@@ -135,7 +135,7 @@ class Orchestrator:
         initial_agent=None,
         run_id: str | None = None,
         task=None,
-        visited: set[str] | None = None,
+        route_trace: list[str] | None = None,
     ):
         """
         Run the agent chain starting from initial_agent (or router default).
@@ -146,11 +146,11 @@ class Orchestrator:
         if not agent:
             await send("[NexusCrew] 没有可用的 Agent，请先使用 /crew 编组。")
             return
-        visited = set(visited or [])
-        if agent.name in visited:
+        route_trace = list(route_trace or [])
+        if self._would_create_route_loop(route_trace, agent.name):
             await send(f"⚠️ 检测到 @{agent.name} 的循环路由，停止当前链路。")
             return
-        visited.add(agent.name)
+        route_trace.append(agent.name)
 
         run_id = run_id or self._new_run_id()
         task, task_created = self._ensure_task(
@@ -321,6 +321,16 @@ class Orchestrator:
                 summary=reply[:120],
                 content=reply,
             ))
+            if agent.role == "dev":
+                review_packet = public_reply.split("\n", 1)[1] if "\n" in public_reply else public_reply
+                self.artifact_store.append(ArtifactRecord(
+                    task_id=task.id,
+                    run_id=run_id,
+                    type="review_packet",
+                    source=agent.name,
+                    summary=review_packet.splitlines()[0][:120] if review_packet else "dev handoff",
+                    content=review_packet,
+                ))
             await self.github_sync.mirror_comment(task, agent.name, mirror_reply)
             await self.slack_sync.mirror_comment(task, agent.name, mirror_reply)
             self.scoped_memory.append(f"task:{task.id}", agent.name, reply[:500], importance=2)
@@ -368,13 +378,14 @@ class Orchestrator:
                 current_message=reply,
             )
 
-            self._advance_task_after_reply(task, agent, reply)
-            await self._maybe_sync_pr(chat_id, task, reply)
+            routing_reply = public_reply if agent.role == "dev" else reply
+            self._advance_task_after_reply(task, agent, reply, routing_reply=routing_reply)
+            await self._maybe_sync_pr(chat_id, task, routing_reply)
             self._update_stuck_report(chat_id, task.id)
 
             # Detect next agent
             next_agents = [
-                candidate for candidate in self.router.detect_all(reply)
+                candidate for candidate in self.router.detect_all(routing_reply)
                 if candidate.name != agent.name
             ]
             if agent.role == "pm" and self._is_status_query(message):
@@ -392,7 +403,7 @@ class Orchestrator:
                         next_agent,
                         run_id=run_id,
                         task=task,
-                        visited=visited,
+                        route_trace=route_trace,
                     )
                 self._record_event(
                     run_id,
@@ -405,9 +416,10 @@ class Orchestrator:
                 return
 
             next_agent = next_agents[0]
-            if next_agent.name in visited:
+            if self._would_create_route_loop(route_trace, next_agent.name):
                 await send(f"⚠️ 检测到 @{next_agent.name} 的循环路由，停止当前链路。")
                 break
+            route_trace.append(next_agent.name)
             message = reply
             agent   = next_agent
         else:
@@ -473,6 +485,22 @@ class Orchestrator:
         if hr_agent and agent.role != "hr" and self._consume_hr_auto_eval_budget(chat_id):
             # Task 3.3 完成: 任务链结束后异步触发 HR 评估。
             asyncio.create_task(self._hr_evaluate(hr_agent, chat_id, send))
+
+    def _would_create_route_loop(self, route_trace: list[str], next_agent_name: str) -> bool:
+        prospective = list(route_trace) + [next_agent_name]
+        if prospective.count(next_agent_name) > 3:
+            return True
+        if len(prospective) >= 6:
+            recent6 = prospective[-6:]
+            if recent6[:3] == recent6[3:] and len(set(recent6[:3])) >= 2:
+                return True
+            if (
+                len(set(recent6[::2])) == 1
+                and len(set(recent6[1::2])) == 1
+                and recent6[0] != recent6[1]
+            ):
+                return True
+        return False
 
     def _find_recent_dev(self, history: list[dict]):
         # Task 3.2 完成: 从历史中回溯最近一个 Dev，给 review 指标归因。
@@ -800,20 +828,35 @@ class Orchestrator:
         if agent.role != "dev":
             return f"**[{agent.name}]**\n{self._strip_code_blocks(reply)}"
 
-        changed_files = await self.executor.git_changed_files()
+        changed_files = await self._task_scoped_changed_files(chat_id, task)
+        diff_summary = await self._task_scoped_diff_summary(chat_id, task, changed_files)
         lines = [f"**[{agent.name}]**"]
         summary = self._summarize_dev_reply(reply)
+        review_requested = "@architect" in reply or "Code Review 请求" in reply
+        if review_requested and not changed_files:
+            summary = "交付摘要：仅完成仓库勘察，尚未形成当前任务代码改动。"
         if summary:
-            lines.append(summary)
+            if summary.startswith("交付摘要"):
+                lines.append(summary)
+            else:
+                lines.append(f"交付摘要：{summary}")
         if changed_files:
             preview = ", ".join(changed_files[:5])
             more = f" (+{len(changed_files) - 5})" if len(changed_files) > 5 else ""
             lines.append(f"Files: {preview}{more}")
+        elif review_requested:
+            lines.append("Files: (no task-scoped changes yet)")
+        if diff_summary:
+            lines.append(f"Diff: {diff_summary}")
+        if task and getattr(task, "branch_name", ""):
+            lines.append(f"Branch: {task.branch_name}")
         shell_summary = self._build_shell_summary(agent, getattr(artifacts, "shell_output", ""))
         if shell_summary:
             lines.append(f"Validation: {shell_summary}")
-        if "@architect" in reply or "Code Review 请求" in reply:
+        if review_requested and changed_files:
             lines.append("Next: @architect review")
+        elif review_requested:
+            lines.append("Next: continue implementation")
         elif "阻塞" in reply or "求助" in reply:
             lines.append("Next: waiting for unblock")
         elif not changed_files and not shell_summary:
@@ -831,12 +874,17 @@ class Orchestrator:
         return body
 
     def _strip_code_blocks(self, text: str) -> str:
-        stripped = _CODE_BLOCK_RE.sub("[code omitted in Telegram; see artifacts / GitHub]", text).strip()
+        stripped = _CODE_BLOCK_RE.sub("\n[code omitted in Telegram; see artifacts / GitHub]\n", text)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
         return stripped
 
     def _summarize_dev_reply(self, reply: str) -> str:
         stripped = self._strip_code_blocks(reply)
         lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        lines = [line for line in lines if line != "[code omitted in Telegram; see artifacts / GitHub]"]
+        for line in lines:
+            if line.startswith("交付摘要"):
+                return line[:220]
         for line in lines:
             if "Code Review 请求" in line or "阻塞" in line or "求助" in line:
                 return line
@@ -844,6 +892,32 @@ class Orchestrator:
             return "已执行开发步骤。"
         summary = lines[0]
         return summary[:220]
+
+    async def _task_scoped_changed_files(self, chat_id: int, task) -> list[str]:
+        current = await self.executor.git_changed_files(limit=64)
+        if task is None:
+            return current
+        session = self.branch_sessions.get(chat_id, task.id)
+        baseline = getattr(session, "baseline_dirty_files", {}) if session else {}
+        if not baseline:
+            return current
+        current_hashes = await self.executor.file_hashes(current)
+        scoped: list[str] = []
+        for path in current:
+            baseline_hash = baseline.get(path)
+            current_hash = current_hashes.get(path, "__missing__")
+            if baseline_hash is None or baseline_hash != current_hash:
+                scoped.append(path)
+        return scoped
+
+    async def _task_scoped_diff_summary(self, chat_id: int, task, files: list[str]) -> str:
+        if not files:
+            return ""
+        if hasattr(self.executor, "git_diff_summary_for_files"):
+            return await self.executor.git_diff_summary_for_files(files)
+        if hasattr(self.executor, "git_diff_summary"):
+            return await self.executor.git_diff_summary()
+        return ""
 
     def _build_shell_summary(self, agent, shell_output: str) -> str:
         if not shell_output:
@@ -855,12 +929,27 @@ class Orchestrator:
         if "[approval required:" in shell_output:
             return "需要审批后才能继续执行。"
         if self.executor.is_failure(shell_output):
+            stderr_lines = []
+            in_stderr = False
+            for line in lines:
+                if line.startswith("[stderr]"):
+                    in_stderr = True
+                    continue
+                if in_stderr:
+                    stderr_lines.append(line)
+            search_space = stderr_lines or lines
             err_line = next(
                 (
-                    line for line in lines
-                    if any(keyword in line.lower() for keyword in ("stderr", "error", "failed", "traceback", "fatal", "timeout"))
+                    line for line in search_space
+                    if any(
+                        keyword in line.lower()
+                        for keyword in ("error collecting", "traceback", "fatal", "timeout", "permission denied", "command not found", "no such file")
+                    )
                 ),
-                lines[-1] if lines else "执行失败",
+                next(
+                    (line for line in search_space if line.startswith("E ") or line.startswith("E   ")),
+                    search_space[-1] if search_space else "执行失败",
+                ),
             )
             return err_line[:220]
         command_count = sum(1 for line in lines if line.startswith("$ "))
@@ -1070,11 +1159,12 @@ class Orchestrator:
             task.transition(TaskStatus.VALIDATING)
         self.state_store.save_task(self._task_chat_id(task.id), task)
 
-    def _advance_task_after_reply(self, task, agent, reply: str):
+    def _advance_task_after_reply(self, task, agent, reply: str, routing_reply: str | None = None):
         if task is None:
             return
+        routing_reply = routing_reply or reply
         if agent.role == "dev" and any(
-            keyword in reply for keyword in ("@architect", "Review", "review", "Code Review")
+            keyword in routing_reply for keyword in ("@architect", "Review", "review", "Code Review")
         ):
             if task.status == TaskStatus.PLANNING:
                 task.transition(TaskStatus.IN_PROGRESS)
@@ -1088,6 +1178,11 @@ class Orchestrator:
                 if task.status == TaskStatus.REVIEW_REQ:
                     task.transition(TaskStatus.REVIEWING)
                 task.transition(TaskStatus.IN_PROGRESS)
+            elif "未给出有效评审结论" in reply:
+                task.transition(TaskStatus.IN_PROGRESS)
+                pm = self.router.default_agent()
+                if pm is not None:
+                    task.assigned_to = pm.name
         if agent.role == "pm" and any(keyword in reply for keyword in ("验收通过", "DONE", "完成")):
             if task.status == TaskStatus.ACCEPTED:
                 task.transition(TaskStatus.VALIDATING)
@@ -1105,6 +1200,8 @@ class Orchestrator:
         branch = self._build_task_branch_name(task)
         try:
             base_branch = await self.executor.git_current_branch()
+            baseline_dirty_files = await self.executor.git_changed_files(limit=64)
+            baseline_dirty_hashes = await self.executor.file_hashes(baseline_dirty_files)
             await self.executor.git_create_branch(branch)
             task.branch_name = branch
             self.branch_sessions.save(BranchSession(
@@ -1112,6 +1209,7 @@ class Orchestrator:
                 task_id=task.id,
                 branch_name=branch,
                 base_branch=base_branch,
+                baseline_dirty_files=baseline_dirty_hashes,
             ))
             self.artifact_store.append(ArtifactRecord(
                 task_id=task.id,

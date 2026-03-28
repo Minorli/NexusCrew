@@ -24,6 +24,48 @@ def test_background_runner_tracks_completed_job():
     assert job.status == "completed"
 
 
+def test_background_runner_can_finish_in_waiting_state():
+    runner = BackgroundTaskRunner()
+
+    async def work():
+        return None
+
+    async def on_complete(job):
+        return "waiting"
+
+    async def main():
+        job_id = runner.submit("demo", work(), on_complete=on_complete)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return job_id
+
+    job_id = asyncio.run(main())
+    job = runner.get(job_id)
+    assert job is not None
+    assert job.status == "waiting"
+
+
+def test_background_runner_waiting_job_is_not_treated_as_inflight():
+    runner = BackgroundTaskRunner()
+
+    async def work():
+        return None
+
+    async def on_complete(job):
+        return "waiting"
+
+    async def main():
+        job_id = runner.submit("demo", work(), task_id="T-0001", on_complete=on_complete)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return job_id
+
+    job_id = asyncio.run(main())
+    assert runner.get(job_id).status == "waiting"
+    assert runner.active_task_ids() == set()
+    assert "待续任务" in runner.format_status()
+
+
 def test_background_runner_cancel_job():
     runner = BackgroundTaskRunner()
 

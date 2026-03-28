@@ -2,85 +2,91 @@ from pathlib import Path
 
 import pytest
 
-from nexuscrew.config import load_config
+from nexuscrew.config import load_crew_config
 
 
-def _write_config(tmp_path: Path, body: str) -> Path:
-    path = tmp_path / "crew.local.yaml"
-    path.write_text(body.strip() + "\n")
+def write_config(tmp_path: Path, content: str) -> Path:
+    path = tmp_path / "crew.yaml"
+    path.write_text(content, encoding="utf-8")
     return path
 
 
-def test_missing_bot_token_raises_value_error(tmp_path: Path):
-    path = _write_config(
+def test_load_crew_config_rejects_missing_project_dir(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
-        telegram:
-          chat_id: "123456"
-        agents: []
-        """,
+agents:
+  - role: dev
+    name: dev-01
+    model: gpt-5
+""".strip(),
     )
-    with pytest.raises(ValueError, match="telegram\.bot_token"):
-        load_config(path)
+
+    with pytest.raises(ValueError, match="project_dir"):
+        load_crew_config(path)
 
 
-def test_missing_chat_id_raises_value_error(tmp_path: Path):
-    path = _write_config(
+def test_load_crew_config_rejects_non_list_agents(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
-        telegram:
-          bot_token: "123456:ABCdef123"
-        agents: []
-        """,
+project_dir: /tmp/project
+agents: {}
+""".strip(),
     )
-    with pytest.raises(ValueError, match="telegram\.chat_id"):
-        load_config(path)
+
+    with pytest.raises(ValueError, match="'agents' must be a list"):
+        load_crew_config(path)
 
 
-def test_invalid_bot_token_format_raises_value_error(tmp_path: Path):
-    path = _write_config(
+def test_load_crew_config_rejects_agent_missing_required_fields(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
-        telegram:
-          bot_token: "not-a-valid-token"
-          chat_id: "123456"
-        agents: []
-        """,
+project_dir: /tmp/project
+agents:
+  - role: dev
+    name: dev-01
+""".strip(),
     )
-    with pytest.raises(ValueError, match="format is invalid"):
-        load_config(path)
+
+    with pytest.raises(ValueError, match="missing required fields"):
+        load_crew_config(path)
 
 
-def test_undefined_roles_raise_value_error(tmp_path: Path):
-    path = _write_config(
+def test_load_crew_config_rejects_non_mapping_orchestrator(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
-        telegram:
-          bot_token: "123456:ABCdef123"
-          chat_id: "123456"
-        agents:
-          - name: dev1
-            roles: ["dev", "invalid_role"]
-        """,
+project_dir: /tmp/project
+agents:
+  - role: dev
+    name: dev-01
+    model: gpt-5
+orchestrator: []
+""".strip(),
     )
-    with pytest.raises(ValueError, match="undefined roles: invalid_role"):
-        load_config(path)
+
+    with pytest.raises(ValueError, match="'orchestrator' must be a mapping"):
+        load_crew_config(path)
 
 
-def test_valid_config_loads_successfully(tmp_path: Path):
-    path = _write_config(
+def test_load_crew_config_accepts_minimal_valid_file(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
-        telegram:
-          bot_token: "123456:ABCdef123"
-          chat_id: "123456"
-        agents:
-          - name: dev1
-            role: dev
-            roles: ["dev"]
-        """,
+project_dir: /tmp/project
+project_prefix: demo
+agents:
+  - role: dev
+    name: dev-01
+    model: gpt-5
+""".strip(),
     )
-    config = load_config(path)
-    assert config.telegram.bot_token == "123456:ABCdef123"
-    assert str(config.telegram.chat_id) == "123456"
+
+    config = load_crew_config(path)
+
+    assert config.project_dir == Path("/tmp/project")
+    assert config.project_prefix == "demo"
     assert len(config.agents) == 1
+    assert config.agents[0].name == "dev-01"
