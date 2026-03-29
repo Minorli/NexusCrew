@@ -851,12 +851,16 @@ class Orchestrator:
         if task and getattr(task, "branch_name", ""):
             lines.append(f"Branch: {task.branch_name}")
         shell_summary = self._build_shell_summary(agent, getattr(artifacts, "shell_output", ""))
+        shell_failed = self.executor.is_failure(getattr(artifacts, "shell_output", ""))
         if shell_summary:
             lines.append(f"Validation: {shell_summary}")
-        if review_requested and changed_files:
+        if review_requested and changed_files and not shell_failed:
             lines.append("Next: @architect review")
         elif review_requested:
-            lines.append("Next: continue implementation")
+            if shell_failed:
+                lines.append("Next: fix failing validation")
+            else:
+                lines.append("Next: continue implementation")
         elif "阻塞" in reply or "求助" in reply:
             lines.append("Next: waiting for unblock")
         elif not changed_files and not shell_summary:
