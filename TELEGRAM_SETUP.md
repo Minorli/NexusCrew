@@ -16,11 +16,12 @@ NexusCrew 使用 **多 Bot + Dispatcher** 模式：
 ```
 群成员列表示意：
   👤 你（Human，群主）
-  🤖 @nexus_dispatch   ← 监听者，接收所有消息
-  🤖 @nexus_alice      ← PM Agent
-  🤖 @nexus_bob        ← Dev Agent
-  🤖 @nexus_charlie    ← Dev Agent
-  🤖 @nexus_dave       ← Architect Agent
+  🤖 @nexus_dispatch_bot   ← 监听者，接收所有消息
+  🤖 @nexus_alice_bot      ← PM Agent
+  🤖 @nexus_bob_bot        ← Dev Agent
+  🤖 @nexus_charlie_bot    ← Dev Agent
+  🤖 @nexus_dave_bot       ← Architect Agent
+  🤖 @nexus_eve_bot        ← QA Agent
 ```
 
 ---
@@ -56,6 +57,7 @@ username:       nexus_dispatch_bot
 | Dev | NexusCrew Dev 1 | nexus_bob_bot | `bob` |
 | Dev | NexusCrew Dev 2 | nexus_charlie_bot | `charlie` |
 | Architect | NexusCrew Arch | nexus_dave_bot | `dave` |
+| QA | NexusCrew QA | nexus_eve_bot | `eve` |
 
 Agent Bot **保持默认隐私模式（Enabled）**，无需额外配置。
 
@@ -79,6 +81,7 @@ Agent Bot **保持默认隐私模式（Enabled）**，无需额外配置。
 @nexus_bob_bot
 @nexus_charlie_bot
 @nexus_dave_bot
+@nexus_eve_bot
 ```
 
 ### 2-C. 获取群组 chat_id
@@ -107,6 +110,7 @@ AGENT_BOT_TOKENS = {
     "bob":     "<nexus_bob_bot token>",
     "charlie": "<nexus_charlie_bot token>",
     "dave":    "<nexus_dave_bot token>",
+    "eve":     "<nexus_eve_bot token>",
 }
 
 # Bot username → Agent 名字映射（Router 用）
@@ -115,6 +119,7 @@ BOT_USERNAME_MAP = {
     "nexus_bob_bot":     "bob",
     "nexus_charlie_bot": "charlie",
     "nexus_dave_bot":    "dave",
+    "nexus_eve_bot":     "eve",
 }
 ```
 
@@ -135,7 +140,7 @@ python tg_orchestrator.py
 应收到 Dispatcher Bot 的欢迎消息。然后编组：
 
 ```
-/crew ~/myproject pm:alice dev:bob dev:charlie architect:dave
+/crew ~/myproject pm:alice dev:bob dev:charlie architect:dave qa:eve
 ```
 
 应收到编组成功的摘要，并在群里看到 `/status` 可用。
@@ -152,6 +157,21 @@ AGENT_BOT_TOKENS = {}   # 所有 Agent 由 Dispatcher 代发，加名字前缀
 ```
 
 系统自动降级，功能完整，体验略差（Agent 没有独立身份）。
+
+---
+
+## 推荐角色分工
+
+- `PM`：拆需求、排优先级、做最终 acceptance
+- `Dev`：实现、验证、提交 review packet
+- `Architect`：review / 风险判断 / 打回或 `LGTM`
+- `QA`：质量闸门、回归验证、发布前 `Go / No-Go`
+
+推荐的普通任务链路：
+
+```text
+Human -> PM -> Dev -> Architect review -> QA quality gate -> PM acceptance
+```
 
 ---
 

@@ -6,6 +6,7 @@ It is designed to behave less like a single chatbot and more like a visible engi
 - PM plans and decomposes work
 - Dev agents implement and validate changes
 - Architect reviews for correctness and risk
+- QA enforces the quality gate before acceptance and release
 - HR tracks delivery quality and team health
 - GitHub keeps the durable engineering record
 
@@ -27,7 +28,7 @@ Core ideas:
 
 ### Multi-Agent Runtime
 
-- Heterogeneous agent roles: PM, Dev, Architect, HR
+- Heterogeneous agent roles: PM, Dev, Architect, QA, HR
 - Dynamic crew initialization from YAML or Telegram commands
 - Multi-bot mode with per-agent Telegram identity
 - Single-bot fallback when dedicated agent bots are not configured
@@ -38,6 +39,8 @@ Core ideas:
 - Task lifecycle tracking with explicit states
 - Background runs for long-lived tasks
 - Git branch session creation for Dev work
+- Git-first review packet generation for Architect review
+- QA quality gate before PM acceptance and release
 - Draft PR generation and PR-aware summaries
 - CI summary ingestion and merge-gate support
 
@@ -72,7 +75,7 @@ Core ideas:
 Telegram / Slack
     -> ChatOps Layer
     -> Router + Orchestrator
-    -> PM / Dev / Architect / HR Agents
+    -> PM / Dev / Architect / QA / HR Agents
     -> Shell / Git / Memory / Metrics / Trace
     -> GitHub / PR / CI / Artifacts / Checkpoints / SQLite State
 ```
@@ -170,6 +173,7 @@ NexusCrew is opinionated about interaction quality:
 
 - Telegram should not be flooded with raw shell logs and giant code blocks
 - Dev execution details are summarized in Telegram and preserved in artifacts / GitHub
+- Review, QA, and acceptance should consume a compact git-first handoff instead of raw shell transcripts
 - Status-style questions should be answered by PM without waking the whole team
 - Stale tasks should not spam the group repeatedly
 - A top-level team summary belongs in Telegram
