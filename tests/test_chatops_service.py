@@ -16,6 +16,7 @@ def test_chatops_service_shared_paths():
         task_id="",
         run_id="",
         on_error=None,
+        on_complete=None,
         on_heartbeat=None,
         heartbeat_interval=45,
         first_heartbeat_delay=20,

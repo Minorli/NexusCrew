@@ -213,6 +213,13 @@ class ChatOpsService:
                 f"当前状态 `{current.status.value}`。"
             )
 
+        async def notify_complete(job):
+            current = self.orchestrator.task_tracker.get(chat_id, task.id) or task
+            status_value = getattr(current.status, "value", str(current.status))
+            if status_value in ("done", "failed"):
+                return "completed"
+            return "waiting"
+
         return self.runner.submit(
             message,
             self.orchestrator.run_chain(message, chat_id, send, run_id=run_id, task=task),
@@ -220,6 +227,7 @@ class ChatOpsService:
             task_id=task.id,
             run_id=run_id,
             on_error=notify_failure,
+            on_complete=notify_complete,
             on_heartbeat=notify_heartbeat,
         )
 

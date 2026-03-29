@@ -2,7 +2,56 @@
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 
+SUPPORTED_BACKENDS = {"openai", "claude", "codex", "shell", "dummy"}
+
+
+def _validate_positive_int(name: str, value: object) -> int:
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a positive integer") from None
+    if ivalue <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return ivalue
+
+
+
+def _validate_agents(raw_agents: object) -> list[dict]:
+    if raw_agents is None:
+        raise ValueError("crew.local.yaml missing required 'agents' field")
+    if not isinstance(raw_agents, list):
+        raise ValueError("'agents' must be a list")
+
+    seen_names: set[str] = set()
+    validated: list[dict] = []
+    for index, agent in enumerate(raw_agents):
+        if not isinstance(agent, dict):
+            raise ValueError(f"agent at index {index} must be a mapping")
+
+        name = str(agent.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"agent at index {index} missing required 'name'")
+        if name in seen_names:
+            raise ValueError(f"duplicate agent name: {name}")
+        seen_names.add(name)
+
+        role = str(agent.get("role") or "").strip()
+        if not role:
+            raise ValueError(f"agent '{name}' missing required 'role'")
+
+        backend = str(agent.get("backend") or "").strip()
+        if not backend:
+            raise ValueError(f"agent '{name}' missing required 'backend'")
+        if backend not in SUPPORTED_BACKENDS:
+            supported = ", ".join(sorted(SUPPORTED_BACKENDS))
+            raise ValueError(
+                f"agent '{name}' has unsupported backend '{backend}'; supported: {supported}"
+            )
+
+        validated.append(agent)
+    return validated
 import yaml
 
 
@@ -138,3 +187,31 @@ def _read_secret_from_env(name: str) -> str:
     if value is None or not value.strip():
         raise EnvironmentError(f"Missing required environment variable: {name}")
     return value
+
+
+ALLOWED_ROLES = {"pm", "dev", "architect", "hr", "qa"}
+BOT_TOKEN_PATTERN = re.compile(r"^\d+:[A-Za-z0-9]+$")
+
+
+def _validate_telegram_config(raw: dict) -> None:
+    telegram = raw.get("telegram") or {}
+    missing = []
+    if not telegram.get("bot_token"):
+        missing.append("telegram.bot_token")
+    if telegram.get("chat_id") in (None, ""):
+        missing.append("telegram.chat_id")
+    if missing:
+        raise ValueError(f"Missing required config field(s): {', '.join(missing)}")
+
+    bot_token = str(telegram.get("bot_token"))
+    if not BOT_TOKEN_PATTERN.match(bot_token):
+        raise ValueError("Invalid telegram.bot_token format, expected digits:alphanumeric")
+
+
+def _validate_roles(raw: dict) -> None:
+    roles = raw.get("roles") or []
+    if not isinstance(roles, list):
+        return
+    invalid = [role for role in roles if role not in ALLOWED_ROLES]
+    if invalid:
+        raise ValueError(f"Undefined role(s): {', '.join(invalid)}")

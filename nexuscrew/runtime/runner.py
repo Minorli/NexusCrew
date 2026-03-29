@@ -23,7 +23,9 @@ class BackgroundRun:
 
 class BackgroundTaskRunner:
     """Track and manage background async tasks."""
-    TERMINAL_STATUSES = {"completed", "failed", "cancelled", "recovered"}
+    TERMINAL_STATUSES = {"completed", "failed", "cancelled", "recovered", "interrupted"}
+    INFLIGHT_STATUSES = {"pending", "running"}
+    ACTIVE_STATUSES = {"pending", "running", "waiting"}
 
     def __init__(self, state_store=None):
         # Task A4 完成: 后台任务执行器与可查询状态。
@@ -71,6 +73,7 @@ class BackgroundTaskRunner:
         task_id: str = "",
         run_id: str = "",
         on_error=None,
+        on_complete=None,
         on_heartbeat=None,
         heartbeat_interval: float = 45,
         first_heartbeat_delay: float = 20,
@@ -89,6 +92,7 @@ class BackgroundTaskRunner:
             job,
             coro,
             on_error=on_error,
+            on_complete=on_complete,
             on_heartbeat=on_heartbeat,
             heartbeat_interval=heartbeat_interval,
             first_heartbeat_delay=first_heartbeat_delay,
@@ -100,6 +104,7 @@ class BackgroundTaskRunner:
         job_id: str,
         coro,
         on_error=None,
+        on_complete=None,
         on_heartbeat=None,
         heartbeat_interval: float = 45,
         first_heartbeat_delay: float = 20,
@@ -112,6 +117,7 @@ class BackgroundTaskRunner:
             job,
             coro,
             on_error=on_error,
+            on_complete=on_complete,
             on_heartbeat=on_heartbeat,
             heartbeat_interval=heartbeat_interval,
             first_heartbeat_delay=first_heartbeat_delay,
@@ -123,6 +129,7 @@ class BackgroundTaskRunner:
         job: BackgroundRun,
         coro,
         on_error=None,
+        on_complete=None,
         on_heartbeat=None,
         heartbeat_interval: float = 45,
         first_heartbeat_delay: float = 20,
@@ -151,7 +158,15 @@ class BackgroundTaskRunner:
                         await on_heartbeat(job)
                         timeout = interval
                 if job.status != "cancelled":
-                    job.status = "completed"
+                    next_status = "completed"
+                    if on_complete is not None:
+                        try:
+                            maybe_status = await on_complete(job)
+                            if maybe_status:
+                                next_status = maybe_status
+                        except Exception:
+                            next_status = "completed"
+                    job.status = next_status
                     job.touch()
                     self._persist(job)
             except asyncio.CancelledError:
@@ -184,7 +199,13 @@ class BackgroundTaskRunner:
     def list_active_runs(self) -> list[BackgroundRun]:
         return [
             job for job in self.list_runs()
-            if job.status not in self.TERMINAL_STATUSES
+            if job.status in self.ACTIVE_STATUSES
+        ]
+
+    def list_inflight_runs(self) -> list[BackgroundRun]:
+        return [
+            job for job in self.list_runs()
+            if job.status in self.INFLIGHT_STATUSES
         ]
 
     def list_failed_runs(self) -> list[BackgroundRun]:
@@ -198,7 +219,7 @@ class BackgroundTaskRunner:
     def active_task_ids(self) -> set[str]:
         return {
             job.task_id
-            for job in self.list_active_runs()
+            for job in self.list_inflight_runs()
             if getattr(job, "task_id", "")
         }
 
@@ -208,7 +229,14 @@ class BackgroundTaskRunner:
     async def cancel(self, job_id: str) -> bool:
         task = self._tasks.get(job_id)
         job = self._jobs.get(job_id)
-        if task is None or job is None or task.done():
+        if job is None:
+            return False
+        if job.status == "interrupted":
+            job.status = "cancelled"
+            job.touch()
+            self._persist(job)
+            return True
+        if task is None or task.done():
             return False
         task.cancel()
         try:
@@ -245,15 +273,24 @@ class BackgroundTaskRunner:
         return True
 
     def format_status(self) -> str:
-        jobs = self.list_active_runs()
-        if not jobs:
+        inflight = self.list_inflight_runs()
+        waiting = [job for job in self.list_runs() if job.status == "waiting"]
+        if not inflight and not waiting:
             failed_count = len(self.list_failed_runs())
             if failed_count:
                 return f"当前无活跃后台任务。\n\n失败归档: {failed_count}，使用 /failed 查看详情。"
             return "当前无活跃后台任务。"
-        lines = ["🧵 活跃后台任务：", ""]
-        for job in jobs:
-            lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
+        lines = []
+        if inflight:
+            lines.extend(["🧵 活跃后台任务：", ""])
+            for job in inflight:
+                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
+        if waiting:
+            if lines:
+                lines.append("")
+            lines.extend(["⏸️ 待续任务：", ""])
+            for job in waiting:
+                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
         failed_count = len(self.list_failed_runs())
         if failed_count:
             lines.extend(["", f"失败归档: {failed_count}，使用 /failed 查看详情。"])
