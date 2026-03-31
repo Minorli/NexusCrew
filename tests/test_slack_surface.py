@@ -53,7 +53,17 @@ def test_bot_handles_slack_commands():
         "reject": lambda self, approval_id: f"rejected:{approval_id}",
     })()
     bot._orch = type("Orch", (), {
+        "control_plane_text": lambda self, chat_id, inflight_task_ids=None, waiting_task_ids=None: "control",
         "doctor_report": lambda self, chat_id: "doctor",
+        "agent_presence": lambda self, chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"name": "alice", "role": "pm", "model": "gemini", "presence": "busy", "queue_size": 1, "blocked_count": 0, "inflight_count": 1, "waiting_count": 0, "current_task_id": "T-0001", "load": "active"}],
+        "agent_queue_summaries": lambda self, chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"agent": "alice", "queue": [{"task_id": "T-0001", "runtime_state": "inflight", "next_action": "architect review"}]}],
+        "proactive_recommendations": lambda self, chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"type": "family_escalation", "family_id": "T-0001", "state": "blocked", "reason": "pending_approval"}],
+        "lane_summary": lambda self, chat_id, lane_key, lane_summaries=None, inflight_task_ids=None, waiting_task_ids=None: f"lane:{lane_key}",
+        "lane_trace_summary": lambda self, chat_id, lane_key, lane_summaries=None: f"lane-trace:{lane_key}",
+        "gate_summary": lambda self, task_id: f"gates:{task_id}",
+        "continuation_summary": lambda self, task_id: f"continuation:{task_id}",
+        "family_summary": lambda self, chat_id, family_id: f"family:{family_id}",
+        "session_summary": lambda self, chat_id, session_key: f"session:{session_key}",
         "pause_task": lambda self, chat_id, task_id: True,
         "replay_task": lambda self, chat_id, task_id, send: asyncio.sleep(0, result=True),
         "task_tracker": type("Tracker", (), {
@@ -63,11 +73,25 @@ def test_bot_handles_slack_commands():
         })(),
         "format_task_detail": lambda self, chat_id, task_id: f"task:{task_id}",
     })()
+    bot._runner.active_task_ids = lambda: {"T-0001"}
+    bot._runner.waiting_task_ids = lambda: set()
+    bot._runner.lane_summaries = lambda: [{"lane_key": "chat:1:task:T-0001", "chat_id": 1, "inflight": 1, "waiting": 0, "jobs": [{"id": "BG-0001", "status": "running", "task_id": "T-0001", "label": "demo"}]}]
 
     assert bot._handle_slack_command({"command": "/nexus-status", "text": ""}) == "board"
+    assert bot._handle_slack_command({"command": "/nexus-control", "text": ""}) == "control"
     assert bot._handle_slack_command({"command": "/nexus-doctor", "text": ""}) == "doctor"
+    assert "Agent Presence" in bot._handle_slack_command({"command": "/nexus-presence", "text": ""})
+    assert "Agent Queues" in bot._handle_slack_command({"command": "/nexus-queues", "text": ""})
+    assert "Session Lanes" in bot._handle_slack_command({"command": "/nexus-lanes", "text": ""})
+    assert bot._handle_slack_command({"command": "/nexus-lane", "text": "chat:1:task:T-0001"}) == "lane:chat:1:task:T-0001"
+    assert bot._handle_slack_command({"command": "/nexus-lane-trace", "text": "chat:1:task:T-0001"}) == "lane-trace:chat:1:task:T-0001"
+    assert "family_escalation" in bot._handle_slack_command({"command": "/nexus-proactive", "text": ""})
     assert "APR-0001" in bot._handle_slack_command({"command": "/nexus-approvals", "text": ""})
     assert bot._handle_slack_command({"command": "/nexus-task", "text": "T-0001"}) == "task:T-0001"
+    assert bot._handle_slack_command({"command": "/nexus-gates", "text": "T-0001"}) == "gates:T-0001"
+    assert bot._handle_slack_command({"command": "/nexus-continuation", "text": "T-0001"}) == "continuation:T-0001"
+    assert bot._handle_slack_command({"command": "/nexus-family", "text": "T-0001"}) == "family:T-0001"
+    assert bot._handle_slack_command({"command": "/nexus-session", "text": "chat:1:task:T-0001"}) == "session:chat:1:task:T-0001"
     assert bot._handle_slack_command({"command": "/nexus-new", "text": "ship it"}).startswith("已提交创建任务请求")
     assert bot._handle_slack_command({"command": "/nexus-approve", "text": "APR-0001"}) == "已提交批准执行: APR-0001"
     assert bot._handle_slack_command({"command": "/nexus-reject", "text": "APR-0001"}) == "rejected:APR-0001"

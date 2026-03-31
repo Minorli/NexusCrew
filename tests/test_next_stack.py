@@ -79,12 +79,35 @@ def test_merge_gate_and_artifact_store(tmp_path: Path):
 
     class Task:
         github_pr_number = 1
+        blocked_reason = ""
         status = SimpleNamespace(value="accepted")
 
     gate = MergeGate().build(Task(), CIResult(status="passed", summary="all green"), [], artifacts.list_for_task("T-0001"))
 
     assert gate.ready is True
     assert "可合并" in gate.summary
+    assert gate.reasons == []
+
+
+def test_merge_gate_reports_structured_blockers(tmp_path: Path):
+    artifacts = ArtifactStore(tmp_path / "artifacts.jsonl")
+
+    class Task:
+        github_pr_number = 0
+        blocked_reason = "approval_required"
+        status = SimpleNamespace(value="in_progress")
+
+    approvals = [SimpleNamespace(id="APR-0001", status="pending", risk_level="high", action_type="shell")]
+
+    gate = MergeGate().build(Task(), CIResult(status="pending", summary="checks pending"), approvals, artifacts.list_for_task("T-0001"))
+
+    assert gate.ready is False
+    assert "待审批 APR-0001:high/shell" in gate.summary
+    assert "尚未创建 PR" in gate.summary
+    assert "CI 进行中: checks pending" in gate.summary
+    assert "任务阻塞: approval_required" in gate.summary
+    assert "任务状态未就绪: in_progress" in gate.summary
+    assert "缺少 artifact 摘要" in gate.summary
 
 
 def test_scoped_memory_retriever(tmp_path: Path):
@@ -191,10 +214,20 @@ def test_trace_artifacts_pr_ci_and_board_commands():
     bot._orch = SimpleNamespace(
         trace_summary=lambda task_id: f"trace:{task_id}",
         artifacts_summary=lambda task_id: f"artifacts:{task_id}",
+        gate_summary=lambda task_id: f"gates:{task_id}",
+        continuation_summary=lambda task_id: f"continuation:{task_id}",
+        family_summary=lambda chat_id, family_id: f"family:{family_id}",
+        session_summary=lambda chat_id, session_key: f"session:{session_key}",
+        agent_presence=lambda chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"name": "alice", "role": "pm", "model": "gemini", "presence": "busy", "load": "active", "queue_size": 1, "blocked_count": 0, "inflight_count": 1, "waiting_count": 0, "current_task_id": "T-0001"}],
+        agent_queue_summaries=lambda chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"agent": "alice", "queue": [{"task_id": "T-0001", "runtime_state": "inflight", "next_action": "architect review"}]}],
+        proactive_recommendations=lambda chat_id, inflight_task_ids=None, waiting_task_ids=None: [{"type": "continuation_next_action", "family_id": "T-0001", "actions": ["architect review"]}],
+        control_plane_summary=lambda chat_id, inflight_task_ids=None, waiting_task_ids=None: {"tasks_total": 1},
         pr_summary=lambda chat_id, task_id: f"pr:{task_id}",
         ci_summary=lambda chat_id, task_id: f"ci:{task_id}",
         format_status=lambda chat_id: "status",
     )
+    bot._runner.active_task_ids = lambda: {"T-0001"}
+    bot._runner.waiting_task_ids = lambda: set()
     bot.registry.register(SimpleNamespace(name="alice", role="pm", model_label="gemini"))
 
     class FakeMessage:
@@ -206,13 +239,29 @@ def test_trace_artifacts_pr_ci_and_board_commands():
     update = SimpleNamespace(message=FakeMessage())
 
     asyncio.run(bot.cmd_trace(update, SimpleNamespace(args=["T-0001"])))
+    asyncio.run(bot.cmd_presence(update, SimpleNamespace(args=[])))
+    asyncio.run(bot.cmd_queues(update, SimpleNamespace(args=[])))
+    asyncio.run(bot.cmd_proactive(update, SimpleNamespace(args=[])))
+    asyncio.run(bot.cmd_control(update, SimpleNamespace(args=[])))
     asyncio.run(bot.cmd_artifacts(update, SimpleNamespace(args=["T-0001"])))
     asyncio.run(bot.cmd_pr(update, SimpleNamespace(args=["T-0001"])))
     asyncio.run(bot.cmd_ci(update, SimpleNamespace(args=["T-0001"])))
+    asyncio.run(bot.cmd_gates(update, SimpleNamespace(args=["T-0001"])))
+    asyncio.run(bot.cmd_continuation(update, SimpleNamespace(args=["T-0001"])))
+    asyncio.run(bot.cmd_family(update, SimpleNamespace(args=["T-0001"])))
+    asyncio.run(bot.cmd_session(update, SimpleNamespace(args=["chat:1:task:T-0001"])))
     asyncio.run(bot.cmd_board(update, SimpleNamespace(args=[])))
 
     assert replies[0] == "trace:T-0001"
-    assert replies[1] == "artifacts:T-0001"
-    assert replies[2] == "pr:T-0001"
-    assert replies[3] == "ci:T-0001"
-    assert "Status Board" in replies[4]
+    assert "Agent Presence" in replies[1]
+    assert "Agent Queues" in replies[2]
+    assert "Proactive Recommendations" in replies[3]
+    assert "Control Plane Summary" in replies[4]
+    assert replies[5] == "artifacts:T-0001"
+    assert replies[6] == "pr:T-0001"
+    assert replies[7] == "ci:T-0001"
+    assert replies[8] == "gates:T-0001"
+    assert replies[9] == "continuation:T-0001"
+    assert replies[10] == "family:T-0001"
+    assert replies[11] == "session:chat:1:task:T-0001"
+    assert "Status Board" in replies[12]

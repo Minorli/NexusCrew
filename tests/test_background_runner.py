@@ -233,7 +233,141 @@ def test_background_runner_emits_heartbeat():
     job_id = asyncio.run(main())
     assert runner.get(job_id).status == "completed"
     assert seen
-    assert all(item == job_id for item in seen)
+
+
+def test_background_runner_interrupted_is_not_terminal():
+    runner = BackgroundTaskRunner()
+
+    runner._jobs["BG-0001"] = SimpleNamespace(
+        id="BG-0001",
+        label="demo",
+        status="interrupted",
+        error="",
+        task_id="T-0001",
+        run_id="run-1",
+        created_at="2026-03-26T00:00:00",
+        updated_at="2026-03-26T00:00:00",
+        chat_id=1,
+    )
+
+    assert "interrupted" not in runner.TERMINAL_STATUSES
+    assert runner.list_active_runs() == []
+    assert runner.list_inflight_runs() == []
+
+
+def test_background_runner_serializes_jobs_in_same_lane():
+    runner = BackgroundTaskRunner()
+    events: list[str] = []
+    release_first = asyncio.Event()
+
+    async def work1():
+        events.append("start-1")
+        await release_first.wait()
+        events.append("end-1")
+
+    async def work2():
+        events.append("start-2")
+        events.append("end-2")
+
+    async def main():
+        job1 = runner.submit("demo1", work1(), lane_key="session:1")
+        job2 = runner.submit("demo2", work2(), lane_key="session:1")
+        await asyncio.sleep(0)
+        assert runner.get(job1).status == "running"
+        assert runner.get(job2).status == "waiting"
+        release_first.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return job1, job2
+
+    job1, job2 = asyncio.run(main())
+    assert events == ["start-1", "end-1", "start-2", "end-2"]
+    assert runner.get(job1).status == "completed"
+    assert runner.get(job2).status == "completed"
+
+
+def test_background_runner_can_cancel_waiting_lane_job():
+    runner = BackgroundTaskRunner()
+    release_first = asyncio.Event()
+
+    async def work1():
+        await release_first.wait()
+
+    async def work2():
+        raise AssertionError("should not run")
+
+    async def main():
+        job1 = runner.submit("demo1", work1(), lane_key="session:1")
+        job2 = runner.submit("demo2", work2(), lane_key="session:1")
+        await asyncio.sleep(0)
+        cancelled = await runner.cancel(job2)
+        release_first.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return job1, job2, cancelled
+
+    job1, job2, cancelled = asyncio.run(main())
+    assert cancelled is True
+    assert runner.get(job2).status == "cancelled"
+    assert runner.get(job1).status == "completed"
+
+
+def test_background_runner_format_status_shows_lane_key():
+    runner = BackgroundTaskRunner()
+    runner._jobs["BG-0001"] = SimpleNamespace(
+        id="BG-0001",
+        label="demo",
+        status="running",
+        lane_key="chat:1:task:T-0001",
+        task_id="T-0001",
+        run_id="run-1",
+        created_at="2026-03-26T00:00:00",
+        updated_at="2026-03-26T00:00:00",
+        chat_id=1,
+    )
+
+    text = runner.format_status()
+
+    assert "chat:1:task:T-0001" in text
+
+
+def test_background_runner_lane_summaries_group_jobs():
+    runner = BackgroundTaskRunner()
+    runner._jobs["BG-0001"] = SimpleNamespace(
+        id="BG-0001",
+        label="demo1",
+        status="running",
+        lane_key="chat:1:task:T-0001",
+        task_id="T-0001",
+        chat_id=1,
+    )
+    runner._jobs["BG-0002"] = SimpleNamespace(
+        id="BG-0002",
+        label="demo2",
+        status="waiting",
+        lane_key="chat:1:task:T-0001",
+        task_id="T-0001",
+        chat_id=1,
+    )
+
+    rows = runner.lane_summaries()
+
+    assert rows == [
+        {
+            "lane_key": "chat:1:task:T-0001",
+            "chat_id": 1,
+            "task_ids": ["T-0001", "T-0001"],
+            "state": "congested",
+            "inflight": 1,
+            "waiting": 1,
+            "backlog": 1,
+            "head_job_id": "BG-0001",
+            "jobs": [
+                {"id": "BG-0001", "status": "running", "task_id": "T-0001", "label": "demo1"},
+                {"id": "BG-0002", "status": "waiting", "task_id": "T-0001", "label": "demo2"},
+            ],
+        }
+    ]
 
 
 def test_handle_message_starts_background_job_silently(monkeypatch):

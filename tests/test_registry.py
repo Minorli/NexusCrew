@@ -49,6 +49,16 @@ class TestRegistry:
         names = {i["name"] for i in items}
         assert names == {"alice", "bob"}
 
+    def test_list_by_role(self):
+        reg = AgentRegistry()
+        reg.register(_agent("alice", "pm"))
+        reg.register(_agent("bob", "dev"))
+        reg.register(_agent("charlie", "dev"))
+
+        items = reg.list_by_role("dev")
+
+        assert [agent.name for agent in items] == ["bob", "charlie"]
+
     def test_unregister(self):
         reg = AgentRegistry()
         a = _agent("alice", "pm")

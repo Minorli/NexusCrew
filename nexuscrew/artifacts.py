@@ -14,6 +14,7 @@ class ArtifactRecord:
     source: str
     summary: str
     content: str = ""
+    chat_id: int = 0
     id: str = field(default_factory=lambda: uuid4().hex)
     ts: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -30,15 +31,23 @@ class ArtifactStore:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(artifact), ensure_ascii=False) + "\n")
 
-    def list_for_task(self, task_id: str) -> list[ArtifactRecord]:
-        return [
-            ArtifactRecord(**json.loads(line))
-            for line in self.path.read_text(encoding="utf-8").splitlines()
-            if line.strip() and json.loads(line).get("task_id") == task_id
-        ] if self.path.exists() else []
+    def list_for_task(self, task_id: str, chat_id: int | None = None) -> list[ArtifactRecord]:
+        if not self.path.exists():
+            return []
+        records: list[ArtifactRecord] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if payload.get("task_id") != task_id:
+                continue
+            if chat_id is not None and payload.get("chat_id") not in (None, 0, chat_id):
+                continue
+            records.append(ArtifactRecord(**payload))
+        return records
 
-    def format_for_task(self, task_id: str) -> str:
-        artifacts = self.list_for_task(task_id)
+    def format_for_task(self, task_id: str, chat_id: int | None = None) -> str:
+        artifacts = self.list_for_task(task_id, chat_id=chat_id)
         if not artifacts:
             return "(无 artifacts)"
         lines = ["📦 Artifacts：", ""]

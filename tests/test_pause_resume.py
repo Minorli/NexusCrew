@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 
 from nexuscrew.agents.base import AgentArtifacts, BaseAgent
+from nexuscrew.artifacts import ArtifactRecord
 from nexuscrew.executor.shell import ShellExecutor
 from nexuscrew.memory.crew_memory import CrewMemory
 from nexuscrew.orchestrator import Orchestrator
@@ -87,3 +88,95 @@ def test_orchestrator_resume_from_checkpoint(tmp_path: Path):
     assert asyncio.run(orchestrator.resume_task(1, "T-0001", send_resume)) is True
     assert any(agent_name == "bob" for _, agent_name in resumed)
     assert any(event.type == "run_resumed" for event in orchestrator.event_store.read_all())
+
+
+def test_orchestrator_resume_without_checkpoint_uses_continuation(tmp_path: Path):
+    registry = AgentRegistry()
+    registry.register(FakeAgent("alice", "pm", "继续推进"))
+    executor = ShellExecutor(tmp_path)
+    orchestrator = Orchestrator(
+        registry,
+        Router(registry),
+        CrewMemory(tmp_path / "crew_memory.md"),
+        executor,
+        event_store=EventStore(tmp_path / "events.jsonl"),
+        checkpoint_store=CheckpointStore(tmp_path / "checkpoints.jsonl"),
+    )
+    task = orchestrator.task_tracker.create(1, "处理需求")
+    task.assigned_to = "alice"
+    orchestrator._task_run_ids[(1, "T-0001")] = "run-1"
+    orchestrator.artifact_store.append(
+        ArtifactRecord(
+            task_id="T-0001",
+            run_id="run-1",
+            type="continuation_checkpoint",
+            source="system",
+            summary="continuation:in_progress",
+            content="\n".join(
+                [
+                    "Goal: 处理需求",
+                    "Session: chat:1:task:T-0001",
+                    "Current State: in_progress",
+                    "Owner: @alice",
+                    "Family: T-0001",
+                    "Next Action: request human decision",
+                    "Constraints: blocked=human_input_required",
+                    "Artifacts: route=(none)",
+                    "Stop Conditions: stop until human_input_required is resolved",
+                ]
+            ),
+        )
+    )
+
+    resumed: list[tuple[str, str | None]] = []
+
+    async def send_resume(text: str, agent_name: str | None = None):
+        resumed.append((text, agent_name))
+
+    assert asyncio.run(orchestrator.resume_task(1, "T-0001", send_resume)) is True
+    assert any(agent_name == "alice" for _, agent_name in resumed)
+    assert any(event.type == "run_resumed" for event in orchestrator.event_store.read_all())
+
+
+def test_orchestrator_replay_prefers_continuation_owner_and_next_action(tmp_path: Path):
+    registry = AgentRegistry()
+    registry.register(FakeAgent("dave", "architect", "LGTM"))
+    executor = ShellExecutor(tmp_path)
+    orchestrator = Orchestrator(
+        registry,
+        Router(registry),
+        CrewMemory(tmp_path / "crew_memory.md"),
+        executor,
+    )
+    task = orchestrator.task_tracker.create(1, "处理需求")
+    task.assigned_to = "dave"
+    orchestrator.artifact_store.append(
+        ArtifactRecord(
+            task_id="T-0001",
+            run_id="run-1",
+            type="continuation_checkpoint",
+            source="system",
+            summary="continuation:review_requested",
+            content="\n".join(
+                [
+                    "Goal: 处理需求",
+                    "Session: chat:1:task:T-0001",
+                    "Current State: review_requested",
+                    "Owner: @dave",
+                    "Family: T-0001",
+                    "Next Action: architect review",
+                    "Constraints: blocked=(none)",
+                    "Artifacts: route=(none)",
+                    "Stop Conditions: continue until next gate or explicit blocker",
+                ]
+            ),
+        )
+    )
+
+    replayed: list[tuple[str, str | None]] = []
+
+    async def send_replay(text: str, agent_name: str | None = None):
+        replayed.append((text, agent_name))
+
+    assert asyncio.run(orchestrator.replay_task(1, "T-0001", send_replay)) is True
+    assert any(agent_name == "dave" for _, agent_name in replayed)
