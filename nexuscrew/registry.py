@@ -33,6 +33,9 @@ class AgentRegistry:
         self._rr[role] += 1
         return lst[idx]
 
+    def list_by_role(self, role: str) -> list[BaseAgent]:
+        return list(self._by_role.get(role, []))
+
     def list_all(self) -> list[dict]:
         return [
             {"name": a.name, "role": a.role, "model": a.model_label}

@@ -65,6 +65,7 @@ class DurableStateStore:
                     chat_id INTEGER NOT NULL DEFAULT 0,
                     task_id TEXT NOT NULL,
                     run_id TEXT NOT NULL,
+                    lane_key TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     error TEXT NOT NULL
@@ -76,6 +77,10 @@ class DurableStateStore:
                     description TEXT NOT NULL,
                     status TEXT NOT NULL,
                     assigned_to TEXT NOT NULL,
+                    session_key TEXT NOT NULL DEFAULT '',
+                    family_id TEXT NOT NULL DEFAULT '',
+                    parent_task_id TEXT NOT NULL DEFAULT '',
+                    blocked_reason TEXT NOT NULL DEFAULT '',
                     branch_name TEXT NOT NULL,
                     github_issue_number INTEGER NOT NULL,
                     github_issue_url TEXT NOT NULL,
@@ -107,6 +112,22 @@ class DurableStateStore:
                 conn.execute(
                     "ALTER TABLE background_runs ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0"
                 )
+            if "lane_key" not in columns:
+                conn.execute(
+                    "ALTER TABLE background_runs ADD COLUMN lane_key TEXT NOT NULL DEFAULT ''"
+                )
+            task_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "session_key" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN session_key TEXT NOT NULL DEFAULT ''")
+            if "family_id" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN family_id TEXT NOT NULL DEFAULT ''")
+            if "parent_task_id" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT NOT NULL DEFAULT ''")
+            if "blocked_reason" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''")
 
     def append_event(self, event) -> None:
         with self._connect() as conn:
@@ -207,8 +228,8 @@ class DurableStateStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO background_runs
-                (id, label, status, chat_id, task_id, run_id, created_at, updated_at, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, label, status, chat_id, task_id, run_id, lane_key, created_at, updated_at, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -217,6 +238,7 @@ class DurableStateStore:
                     getattr(run, "chat_id", 0),
                     run.task_id,
                     run.run_id,
+                    getattr(run, "lane_key", ""),
                     run.created_at,
                     run.updated_at,
                     run.error,
@@ -235,11 +257,11 @@ class DurableStateStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO tasks
-                (chat_id, id, description, status, assigned_to, branch_name,
+                (chat_id, id, description, status, assigned_to, session_key, family_id, parent_task_id, blocked_reason, branch_name,
                  github_issue_number, github_issue_url, github_pr_number, github_pr_url,
                  slack_channel, slack_message_ts, slack_thread_ts,
                  created_at, updated_at, history_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
@@ -247,6 +269,10 @@ class DurableStateStore:
                     task.description,
                     task.status.value if hasattr(task.status, "value") else str(task.status),
                     task.assigned_to,
+                    getattr(task, "session_key", f"chat:{chat_id}:task:{task.id}"),
+                    getattr(task, "family_id", task.id),
+                    getattr(task, "parent_task_id", ""),
+                    getattr(task, "blocked_reason", ""),
                     task.branch_name,
                     task.github_issue_number,
                     task.github_issue_url,

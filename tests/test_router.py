@@ -81,6 +81,14 @@ class TestDetectFirst:
         router = _setup(_agent("nexus-qa-01", "qa"), _agent("alice", "pm"))
         assert router.detect_first("@nexus_qa_01_bot 做一轮验收").name == "nexus-qa-01"
 
+    def test_detect_first_routed_marks_role_alias(self):
+        router = _setup(_agent("bob", "dev"), _agent("charlie", "dev"))
+        routed = router.detect_first_routed("@dev 修一下")
+
+        assert routed["kind"] == "role_alias"
+        assert routed["role"] == "dev"
+        assert routed["agent"].name == "bob"
+
 
 class TestDetectAll:
     def test_multiple_mentions(self):

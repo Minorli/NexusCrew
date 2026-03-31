@@ -13,6 +13,7 @@ class BackgroundRun:
     chat_id: int = 0
     task_id: str = ""
     run_id: str = ""
+    lane_key: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = ""
     error: str = ""
@@ -23,7 +24,7 @@ class BackgroundRun:
 
 class BackgroundTaskRunner:
     """Track and manage background async tasks."""
-    TERMINAL_STATUSES = {"completed", "failed", "cancelled", "recovered", "interrupted"}
+    TERMINAL_STATUSES = {"completed", "failed", "cancelled", "recovered"}
     INFLIGHT_STATUSES = {"pending", "running"}
     ACTIVE_STATUSES = {"pending", "running", "waiting"}
 
@@ -32,6 +33,9 @@ class BackgroundTaskRunner:
         self._counter = 0
         self._jobs: dict[str, BackgroundRun] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._lane_active: dict[str, str] = {}
+        self._lane_waiting: dict[str, list[str]] = {}
+        self._deferred: dict[str, tuple] = {}
         self._state_store = state_store
         self._load_from_store()
 
@@ -40,7 +44,7 @@ class BackgroundTaskRunner:
             return
         for record in self._state_store.load_background_runs():
             job = BackgroundRun(**record)
-            if job.status in ("pending", "running"):
+            if job.status in ("pending", "running", "waiting"):
                 job.status = "interrupted"
                 job.touch()
             self._jobs[job.id] = job
@@ -62,6 +66,8 @@ class BackgroundTaskRunner:
             job.run_id = ""
         if not hasattr(job, "chat_id"):
             job.chat_id = 0
+        if not hasattr(job, "lane_key"):
+            job.lane_key = ""
         if self._state_store is not None:
             self._state_store.save_background_run(job)
 
@@ -72,6 +78,7 @@ class BackgroundTaskRunner:
         chat_id: int = 0,
         task_id: str = "",
         run_id: str = "",
+        lane_key: str = "",
         on_error=None,
         on_complete=None,
         on_heartbeat=None,
@@ -86,9 +93,10 @@ class BackgroundTaskRunner:
             chat_id=chat_id,
             task_id=task_id,
             run_id=run_id,
+            lane_key=lane_key,
         )
         self._jobs[job_id] = job
-        self._start_job(
+        self._start_or_queue_job(
             job,
             coro,
             on_error=on_error,
@@ -103,6 +111,7 @@ class BackgroundTaskRunner:
         self,
         job_id: str,
         coro,
+        lane_key: str = "",
         on_error=None,
         on_complete=None,
         on_heartbeat=None,
@@ -112,8 +121,10 @@ class BackgroundTaskRunner:
         job = self._jobs.get(job_id)
         if job is None:
             return False
+        if lane_key:
+            job.lane_key = lane_key
         # Continue the original background run under the same job id.
-        self._start_job(
+        self._start_or_queue_job(
             job,
             coro,
             on_error=on_error,
@@ -123,6 +134,43 @@ class BackgroundTaskRunner:
             first_heartbeat_delay=first_heartbeat_delay,
         )
         return True
+
+    def _start_or_queue_job(
+        self,
+        job: BackgroundRun,
+        coro,
+        on_error=None,
+        on_complete=None,
+        on_heartbeat=None,
+        heartbeat_interval: float = 45,
+        first_heartbeat_delay: float = 20,
+    ):
+        lane_key = getattr(job, "lane_key", "") or ""
+        active_job_id = self._lane_active.get(lane_key) if lane_key else None
+        active_task = self._tasks.get(active_job_id, None) if active_job_id else None
+        if lane_key and active_job_id and active_job_id != job.id and active_task is not None and not active_task.done():
+            job.status = "waiting"
+            job.touch()
+            self._persist(job)
+            self._lane_waiting.setdefault(lane_key, []).append(job.id)
+            self._deferred[job.id] = (
+                coro,
+                on_error,
+                on_complete,
+                on_heartbeat,
+                heartbeat_interval,
+                first_heartbeat_delay,
+            )
+            return
+        self._start_job(
+            job,
+            coro,
+            on_error=on_error,
+            on_complete=on_complete,
+            on_heartbeat=on_heartbeat,
+            heartbeat_interval=heartbeat_interval,
+            first_heartbeat_delay=first_heartbeat_delay,
+        )
 
     def _start_job(
         self,
@@ -135,6 +183,9 @@ class BackgroundTaskRunner:
         first_heartbeat_delay: float = 20,
     ):
         self._persist(job)
+        lane_key = getattr(job, "lane_key", "") or ""
+        if lane_key:
+            self._lane_active[lane_key] = job.id
 
         async def runner():
             job.status = "running"
@@ -190,8 +241,37 @@ class BackgroundTaskRunner:
                         await on_error(job, err)
                     except Exception:
                         pass
+            finally:
+                self._release_lane(job)
 
         self._tasks[job.id] = asyncio.create_task(runner())
+
+    def _release_lane(self, job: BackgroundRun):
+        lane_key = getattr(job, "lane_key", "") or ""
+        if not lane_key:
+            return
+        if self._lane_active.get(lane_key) == job.id:
+            self._lane_active.pop(lane_key, None)
+        waiting = self._lane_waiting.get(lane_key, [])
+        while waiting:
+            next_job_id = waiting.pop(0)
+            deferred = self._deferred.pop(next_job_id, None)
+            next_job = self._jobs.get(next_job_id)
+            if deferred is None or next_job is None or next_job.status == "cancelled":
+                continue
+            coro, on_error, on_complete, on_heartbeat, heartbeat_interval, first_heartbeat_delay = deferred
+            self._start_job(
+                next_job,
+                coro,
+                on_error=on_error,
+                on_complete=on_complete,
+                on_heartbeat=on_heartbeat,
+                heartbeat_interval=heartbeat_interval,
+                first_heartbeat_delay=first_heartbeat_delay,
+            )
+            break
+        if not waiting:
+            self._lane_waiting.pop(lane_key, None)
 
     def list_runs(self) -> list[BackgroundRun]:
         return [self._jobs[job_id] for job_id in sorted(self._jobs)]
@@ -208,6 +288,44 @@ class BackgroundTaskRunner:
             if job.status in self.INFLIGHT_STATUSES
         ]
 
+    def list_waiting_runs(self) -> list[BackgroundRun]:
+        return [job for job in self.list_runs() if job.status == "waiting"]
+
+    def lane_summaries(self) -> list[dict]:
+        lanes: dict[str, list[BackgroundRun]] = {}
+        for job in self.list_runs():
+            lane_key = getattr(job, "lane_key", "") or ""
+            if not lane_key:
+                continue
+            lanes.setdefault(lane_key, []).append(job)
+        rows: list[dict] = []
+        for lane_key, jobs in sorted(lanes.items()):
+            inflight = [job for job in jobs if job.status in self.INFLIGHT_STATUSES]
+            waiting = [job for job in jobs if job.status == "waiting"]
+            state = "congested" if inflight and waiting else "active" if inflight else "queued" if waiting else "idle"
+            rows.append(
+                {
+                    "lane_key": lane_key,
+                    "chat_id": next((getattr(job, "chat_id", 0) for job in jobs if getattr(job, "chat_id", 0)), 0),
+                    "task_ids": [job.task_id for job in jobs if getattr(job, "task_id", "")],
+                    "state": state,
+                    "inflight": len(inflight),
+                    "waiting": len(waiting),
+                    "backlog": len(waiting),
+                    "head_job_id": inflight[0].id if inflight else (waiting[0].id if waiting else ""),
+                    "jobs": [
+                        {
+                            "id": job.id,
+                            "status": job.status,
+                            "task_id": getattr(job, "task_id", ""),
+                            "label": job.label,
+                        }
+                        for job in jobs
+                    ],
+                }
+            )
+        return rows
+
     def list_failed_runs(self) -> list[BackgroundRun]:
         jobs = [job for job in self.list_runs() if job.status == "failed"]
         return sorted(
@@ -223,6 +341,13 @@ class BackgroundTaskRunner:
             if getattr(job, "task_id", "")
         }
 
+    def waiting_task_ids(self) -> set[str]:
+        return {
+            job.task_id
+            for job in self.list_waiting_runs()
+            if getattr(job, "task_id", "")
+        }
+
     def get(self, job_id: str) -> BackgroundRun | None:
         return self._jobs.get(job_id)
 
@@ -232,6 +357,21 @@ class BackgroundTaskRunner:
         if job is None:
             return False
         if job.status == "interrupted":
+            job.status = "cancelled"
+            job.touch()
+            self._persist(job)
+            return True
+        if job.status == "waiting":
+            lane_key = getattr(job, "lane_key", "") or ""
+            if lane_key in self._lane_waiting:
+                self._lane_waiting[lane_key] = [item for item in self._lane_waiting[lane_key] if item != job_id]
+                if not self._lane_waiting[lane_key]:
+                    self._lane_waiting.pop(lane_key, None)
+            deferred = self._deferred.pop(job_id, None)
+            if deferred:
+                coro = deferred[0]
+                if hasattr(coro, "close"):
+                    coro.close()
             job.status = "cancelled"
             job.touch()
             self._persist(job)
@@ -284,13 +424,15 @@ class BackgroundTaskRunner:
         if inflight:
             lines.extend(["🧵 活跃后台任务：", ""])
             for job in inflight:
-                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
+                lane = f" / {job.lane_key}" if getattr(job, "lane_key", "") else ""
+                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}{lane}")
         if waiting:
             if lines:
                 lines.append("")
             lines.extend(["⏸️ 待续任务：", ""])
             for job in waiting:
-                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}")
+                lane = f" / {job.lane_key}" if getattr(job, "lane_key", "") else ""
+                lines.append(f"  [{job.id}] {job.status} — {job.label[:60]}{lane}")
         failed_count = len(self.list_failed_runs())
         if failed_count:
             lines.extend(["", f"失败归档: {failed_count}，使用 /failed 查看详情。"])

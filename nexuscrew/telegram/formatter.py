@@ -19,5 +19,15 @@ def status_table(agents: list[dict]) -> str:
         return "(无 Agent，请先使用 /crew 编组)"
     lines = ["当前编组：", ""]
     for a in agents:
-        lines.append(f"  @{a['name']}  [{a['role']} / {a['model']}]")
+        suffix = ""
+        presence = a.get("presence", "")
+        queue_size = a.get("queue_size")
+        current_task = a.get("current_task_id", "")
+        if presence:
+            suffix = f" / {presence}"
+        if queue_size is not None:
+            suffix += f" / q={queue_size}"
+        if current_task:
+            suffix += f" / {current_task}"
+        lines.append(f"  @{a['name']}  [{a['role']} / {a['model']}{suffix}]")
     return "\n".join(lines)

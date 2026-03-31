@@ -508,7 +508,48 @@ class NexusCrewBot:
         if not self._orch or not context.args:
             await update.message.reply_text("用法: /trace <task_id>")
             return
-        await update.message.reply_text(self._service().trace_text(context.args[0]))
+        await update.message.reply_text(self._service().trace_text(context.args[0], chat_id=update.message.chat_id))
+
+    async def cmd_presence(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        await update.message.reply_text(self._service().presence_text(update.message.chat_id))
+
+    async def cmd_queues(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        await update.message.reply_text(self._service().queues_text(update.message.chat_id))
+
+    async def cmd_lanes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        await update.message.reply_text(self._service().lanes_text(update.message.chat_id))
+
+    async def cmd_lane(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /lane <lane_key>")
+            return
+        await update.message.reply_text(self._service().lane_text(update.message.chat_id, context.args[0]))
+
+    async def cmd_lane_trace(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /lane_trace <lane_key>")
+            return
+        await update.message.reply_text(self._service().lane_trace_text(update.message.chat_id, context.args[0]))
+
+    async def cmd_proactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        await update.message.reply_text(self._service().proactive_text(update.message.chat_id))
+
+    async def cmd_control(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        await update.message.reply_text(self._service().control_text(update.message.chat_id))
 
     async def cmd_artifacts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._require_operate(update):
@@ -516,7 +557,7 @@ class NexusCrewBot:
         if not self._orch or not context.args:
             await update.message.reply_text("用法: /artifacts <task_id>")
             return
-        await update.message.reply_text(self._service().artifacts_text(context.args[0]))
+        await update.message.reply_text(self._service().artifacts_text(context.args[0], chat_id=update.message.chat_id))
 
     async def cmd_pr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._require_operate(update):
@@ -538,6 +579,38 @@ class NexusCrewBot:
         if not await self._require_operate(update):
             return
         await update.message.reply_text(await self._service().board_text(update.message.chat_id))
+
+    async def cmd_gates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /gates <task_id>")
+            return
+        await update.message.reply_text(self._service().gates_text(context.args[0], chat_id=update.message.chat_id))
+
+    async def cmd_continuation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /continuation <task_id>")
+            return
+        await update.message.reply_text(self._service().continuation_text(context.args[0], chat_id=update.message.chat_id))
+
+    async def cmd_family(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /family <family_id>")
+            return
+        await update.message.reply_text(self._service().family_text(update.message.chat_id, context.args[0]))
+
+    async def cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._require_operate(update):
+            return
+        if not self._orch or not context.args:
+            await update.message.reply_text("用法: /session <session_key>")
+            return
+        await update.message.reply_text(self._service().session_text(update.message.chat_id, context.args[0]))
 
     async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._require_operate(update):
@@ -618,10 +691,21 @@ class NexusCrewBot:
         app.add_handler(CommandHandler("skills", self.cmd_skills))
         app.add_handler(CommandHandler("drill", self.cmd_drill))
         app.add_handler(CommandHandler("trace", self.cmd_trace))
+        app.add_handler(CommandHandler("presence", self.cmd_presence))
+        app.add_handler(CommandHandler("queues", self.cmd_queues))
+        app.add_handler(CommandHandler("lanes", self.cmd_lanes))
+        app.add_handler(CommandHandler("lane", self.cmd_lane))
+        app.add_handler(CommandHandler("lane_trace", self.cmd_lane_trace))
+        app.add_handler(CommandHandler("proactive", self.cmd_proactive))
+        app.add_handler(CommandHandler("control", self.cmd_control))
         app.add_handler(CommandHandler("artifacts", self.cmd_artifacts))
         app.add_handler(CommandHandler("pr", self.cmd_pr))
         app.add_handler(CommandHandler("ci", self.cmd_ci))
         app.add_handler(CommandHandler("board", self.cmd_board))
+        app.add_handler(CommandHandler("gates", self.cmd_gates))
+        app.add_handler(CommandHandler("continuation", self.cmd_continuation))
+        app.add_handler(CommandHandler("family", self.cmd_family))
+        app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("pause",  self.cmd_pause))
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("replay", self.cmd_replay))
@@ -702,14 +786,103 @@ class NexusCrewBot:
         tasks = []
         approvals = []
         doctor = ""
+        agent_presence = []
+        families = []
+        sessions = []
+        agent_queues = []
+        proactive = []
+        control_plane = {}
+        inflight_task_ids = self._runner.active_task_ids()
+        waiting_task_ids = self._runner.waiting_task_ids()
         if self._orch:
+            chat_ids = sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+            default_chat_id = chat_ids[0] if chat_ids else 0
+            if getattr(self._orch, "agent_presence", None):
+                if chat_ids:
+                    for chat_id in chat_ids:
+                        agent_presence.extend(
+                            {
+                                **row,
+                                "chat_id": chat_id,
+                            }
+                            for row in self._orch.agent_presence(
+                                chat_id,
+                                inflight_task_ids=inflight_task_ids,
+                                waiting_task_ids=waiting_task_ids,
+                            )
+                        )
+                else:
+                    agent_presence = self._orch.agent_presence(
+                        default_chat_id,
+                        inflight_task_ids=inflight_task_ids,
+                        waiting_task_ids=waiting_task_ids,
+                    )
+            else:
+                agent_presence = self.registry.list_all()
+            if getattr(self._orch, "_family_rollups_with_actions", None):
+                for chat_id in chat_ids:
+                    families.extend(
+                        {
+                            **item,
+                            "chat_id": chat_id,
+                        }
+                        for item in self._orch._family_rollups_with_actions(
+                            chat_id,
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                    )
+            if getattr(self._orch, "_session_rollups_with_actions", None):
+                for chat_id in chat_ids:
+                    sessions.extend(
+                        {
+                            **item,
+                            "chat_id": chat_id,
+                        }
+                        for item in self._orch._session_rollups_with_actions(
+                            chat_id,
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                    )
             for chat_id, items in getattr(self._orch.task_tracker, "_tasks", {}).items():
                 for task in items.values():
+                    runtime_state = self._orch.task_tracker._runtime_state_label(
+                        task,
+                        inflight_task_ids=inflight_task_ids,
+                        waiting_task_ids=waiting_task_ids,
+                        task_stage_sla_seconds=getattr(self._orch, "task_stage_sla_seconds", 0),
+                    )
                     tasks.append({
                         "chat_id": chat_id,
                         "id": task.id,
+                        "session_key": getattr(task, "session_key", f"chat:{chat_id}:task:{task.id}"),
                         "status": task.status.value,
+                        "runtime_state": runtime_state,
                         "assigned_to": task.assigned_to,
+                        "family_id": getattr(task, "family_id", task.id),
+                        "parent_task_id": getattr(task, "parent_task_id", ""),
+                        "blocked_reason": getattr(task, "blocked_reason", ""),
+                        "recent_route": (
+                            self._orch._latest_route_summary_for_chat(task.id, chat_id)
+                            if hasattr(self._orch, "_latest_route_summary_for_chat")
+                            else self._orch._latest_route_summary(task.id)
+                        ),
+                        "latest_gate": (
+                            self._orch._latest_gate_summary_for_chat(task.id, chat_id)
+                            if hasattr(self._orch, "_latest_gate_summary_for_chat")
+                            else self._orch._latest_gate_summary(task.id)
+                        ),
+                        "continuation": (
+                            self._orch._latest_continuation_summary_for_chat(task.id, chat_id)
+                            if hasattr(self._orch, "_latest_continuation_summary_for_chat")
+                            else "(无 continuation)"
+                        ),
+                        "next_action": (
+                            self._orch._latest_continuation_next_action_for_chat(task.id, chat_id)
+                            if hasattr(self._orch, "_latest_continuation_next_action_for_chat")
+                            else ""
+                        ),
                         "github_issue_url": getattr(task, "github_issue_url", ""),
                         "github_pr_url": getattr(task, "github_pr_url", ""),
                         "slack_thread_ts": getattr(task, "slack_thread_ts", ""),
@@ -724,14 +897,174 @@ class NexusCrewBot:
                     }
                     for approval in self._executor.list_pending_approvals()
                 ]
-            if tasks:
-                doctor = self._orch.doctor_report(tasks[0]["chat_id"])
+            if chat_ids:
+                doctor_parts = []
+                for chat_id in chat_ids:
+                    if hasattr(self._orch, "doctor_report"):
+                        report = self._orch.doctor_report(
+                            chat_id,
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                        if report:
+                            heading = f"[chat {chat_id}]\n" if len(chat_ids) > 1 else ""
+                            doctor_parts.append(heading + report)
+                    if hasattr(self._orch, "agent_queue_summaries"):
+                        agent_queues.extend(
+                            {
+                                **row,
+                                "chat_id": chat_id,
+                            }
+                            for row in self._orch.agent_queue_summaries(
+                                chat_id,
+                                inflight_task_ids=inflight_task_ids,
+                                waiting_task_ids=waiting_task_ids,
+                            )
+                        )
+                    if hasattr(self._orch, "proactive_recommendations"):
+                        proactive.extend(
+                            {
+                                **item,
+                                "chat_id": chat_id,
+                            }
+                            for item in self._orch.proactive_recommendations(
+                                chat_id,
+                                inflight_task_ids=inflight_task_ids,
+                                waiting_task_ids=waiting_task_ids,
+                            )
+                        )
+                    if hasattr(self._orch, "control_plane_summary"):
+                        pass
+                doctor = "\n\n".join(part for part in doctor_parts if part)
+                unique_presence: dict[str, dict] = {}
+                presence_rank = {"idle": 0, "active": 1, "waiting": 2, "busy": 3, "blocked": 4, "stale": 5}
+                for row in agent_presence:
+                    key = row["name"]
+                    current = unique_presence.get(key)
+                    if current is None or presence_rank.get(row.get("presence", "idle"), 0) > presence_rank.get(current.get("presence", "idle"), 0):
+                        unique_presence[key] = row
+                control_plane = {
+                    "tasks_total": len(tasks),
+                    "tasks_inflight": sum(1 for item in tasks if item["runtime_state"] == "inflight"),
+                    "tasks_waiting": sum(1 for item in tasks if item["runtime_state"] == "waiting"),
+                    "tasks_blocked": sum(1 for item in tasks if item["runtime_state"] == "blocked"),
+                    "tasks_stale": sum(1 for item in tasks if item["runtime_state"] == "stale"),
+                    "families_total": len(families),
+                    "families_ready_to_close": sum(1 for item in families if item.get("ready_to_close")),
+                    "sessions_total": len(sessions),
+                    "sessions_ready_to_close": sum(1 for item in sessions if item.get("ready_to_close")),
+                    "lanes_total": len([
+                        row
+                        for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                    ]) if hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries") else 0,
+                    "lanes_congested": sum(
+                        1
+                        for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                        if row.get("inflight", 0) > 0 and row.get("waiting", 0) > 0
+                    ) if hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries") else 0,
+                    "lanes_waiting": sum(
+                        row.get("waiting", 0)
+                        for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                    ) if hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries") else 0,
+                    "lanes_blocked": sum(
+                        1
+                        for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                        if row.get("head_blocked_reason")
+                    ) if hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries") else 0,
+                    "lanes_ready_to_close": sum(
+                        1
+                        for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=inflight_task_ids,
+                            waiting_task_ids=waiting_task_ids,
+                        )
+                        if row.get("ready_to_close")
+                    ) if hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries") else 0,
+                    "agents_total": len(unique_presence),
+                    "agents_busy": sum(1 for item in unique_presence.values() if item.get("presence") == "busy"),
+                    "agents_blocked": sum(1 for item in unique_presence.values() if item.get("presence") == "blocked"),
+                    "agents_waiting": sum(1 for item in unique_presence.values() if item.get("presence") == "waiting"),
+                    "agents_idle": sum(1 for item in unique_presence.values() if item.get("presence") == "idle"),
+                    "proactive_total": len(proactive),
+                }
+        else:
+            agent_presence = self.registry.list_all()
         return {
             "agents": self.registry.list_all(),
+            "agent_presence": agent_presence,
+            "families": [
+                {
+                    "chat_id": item.get("chat_id", 0),
+                    "family_id": item["family_id"],
+                    "state": item["state"],
+                    "completion_state": item.get("completion_state", "open"),
+                    "ready_to_close": item.get("ready_to_close", False),
+                    "blocked_reasons": item.get("blocked_reasons", []),
+                    "next_actions": item.get("next_actions", []),
+                    "members": [task.id for task in item["members"]],
+                }
+                for item in families
+            ],
+            "sessions": [
+                {
+                    "chat_id": item.get("chat_id", 0),
+                    "session_key": item["session_key"],
+                    "state": item["state"],
+                    "completion_state": item.get("completion_state", "open"),
+                    "ready_to_close": item.get("ready_to_close", False),
+                    "blocked_reasons": item.get("blocked_reasons", []),
+                    "next_actions": item.get("next_actions", []),
+                    "members": [task.id for task in item["members"]],
+                }
+                for item in sessions
+            ],
+            "agent_queues": agent_queues,
+            "lanes": (
+                [
+                    enriched
+                    for lane_chat_id in sorted(getattr(self._orch.task_tracker, "_tasks", {}).keys())
+                    for enriched in self._orch.lane_runtime_summaries(
+                        lane_chat_id,
+                        self._runner.lane_summaries(),
+                        inflight_task_ids=inflight_task_ids,
+                        waiting_task_ids=waiting_task_ids,
+                    )
+                ]
+                if self._orch and hasattr(self._orch, "lane_runtime_summaries") and hasattr(self._runner, "lane_summaries")
+                else (self._runner.lane_summaries() if hasattr(self._runner, "lane_summaries") else [])
+            ),
+            "proactive": proactive,
+            "control_plane": control_plane,
             "tasks": tasks,
             "approvals": approvals,
             "background_runs": [
-                {"id": run.id, "status": run.status, "label": run.label}
+                {"id": run.id, "status": run.status, "label": run.label, "lane_key": getattr(run, "lane_key", "")}
                 for run in self._runner.list_runs()
             ],
             "doctor": doctor,
@@ -741,7 +1074,13 @@ class NexusCrewBot:
         lines = [
             "📌 NexusCrew Status Board",
             "",
-            status_table(self.registry.list_all()),
+            status_table(
+                self._orch.agent_presence(
+                    chat_id,
+                    inflight_task_ids=self._runner.active_task_ids(),
+                    waiting_task_ids=self._runner.waiting_task_ids(),
+                ) if self._orch and hasattr(self._orch, "agent_presence") else self.registry.list_all()
+            ),
         ]
         if self._startup_warnings:
             lines.extend([
@@ -751,7 +1090,15 @@ class NexusCrewBot:
             ])
         if self._orch:
             if hasattr(self._orch, "format_status"):
-                lines.extend(["", self._orch.format_status(chat_id)])
+                try:
+                    status_text = self._orch.format_status(
+                        chat_id,
+                        inflight_task_ids=self._runner.active_task_ids(),
+                        waiting_task_ids=self._runner.waiting_task_ids(),
+                    )
+                except TypeError:
+                    status_text = self._orch.format_status(chat_id)
+                lines.extend(["", status_text])
             lines.extend(["", self._runner.format_status()])
         return "\n".join(lines)
 
@@ -828,8 +1175,33 @@ class NexusCrewBot:
         service = self._service()
         if command.endswith("status"):
             return self._status_board_by_chat.get(0) or self._build_status_board(0)
+        if command.endswith("control"):
+            chat_id = self._slack_default_chat_id() or 0
+            return service.control_text(chat_id)
         if command.endswith("doctor"):
             return service.doctor_text(0)
+        if command.endswith("presence"):
+            chat_id = self._slack_default_chat_id() or 0
+            return service.presence_text(chat_id)
+        if command.endswith("queues"):
+            chat_id = self._slack_default_chat_id() or 0
+            return service.queues_text(chat_id)
+        if command.endswith("lanes"):
+            chat_id = self._slack_default_chat_id() or 0
+            return service.lanes_text(chat_id)
+        if command.endswith("lane"):
+            if not text:
+                return "用法: /nexus-lane <lane_key>"
+            chat_id = self._slack_default_chat_id() or 0
+            return service.lane_text(chat_id, text)
+        if command.endswith("lane-trace"):
+            if not text:
+                return "用法: /nexus-lane-trace <lane_key>"
+            chat_id = self._slack_default_chat_id() or 0
+            return service.lane_trace_text(chat_id, text)
+        if command.endswith("proactive"):
+            chat_id = self._slack_default_chat_id() or 0
+            return service.proactive_text(chat_id)
         if command.endswith("approvals"):
             return service.approvals_text()
         if command.endswith("new"):
@@ -876,7 +1248,29 @@ class NexusCrewBot:
                 if task is not None:
                     return service.task_text(chat_id, text)
             return f"未找到任务: {text}"
-        return "可用 Slack 命令: /nexus-status /nexus-doctor /nexus-approvals /nexus-task /nexus-new /nexus-approve /nexus-reject /nexus-pause /nexus-replay /nexus-board"
+        if command.endswith("gates"):
+            if not text:
+                return "用法: /nexus-gates <task_id>"
+            return service.gates_text(text, chat_id=self._slack_default_chat_id())
+        if command.endswith("continuation"):
+            if not text:
+                return "用法: /nexus-continuation <task_id>"
+            return service.continuation_text(text, chat_id=self._slack_default_chat_id())
+        if command.endswith("family"):
+            if not text:
+                return "用法: /nexus-family <family_id>"
+            chat_id = self._slack_default_chat_id()
+            if chat_id is None:
+                return "没有可用的默认 chat_id。"
+            return service.family_text(chat_id, text)
+        if command.endswith("session"):
+            if not text:
+                return "用法: /nexus-session <session_key>"
+            chat_id = self._slack_default_chat_id()
+            if chat_id is None:
+                return "没有可用的默认 chat_id。"
+            return service.session_text(chat_id, text)
+        return "可用 Slack 命令: /nexus-status /nexus-control /nexus-doctor /nexus-presence /nexus-queues /nexus-lanes /nexus-lane /nexus-lane-trace /nexus-proactive /nexus-approvals /nexus-task /nexus-gates /nexus-continuation /nexus-family /nexus-session /nexus-new /nexus-approve /nexus-reject /nexus-pause /nexus-replay /nexus-board"
 
     async def _publish_slack_home_if_enabled(self):
         self._slack_app_home = self._slack_app_home or self._build_slack_app_home()
@@ -937,6 +1331,12 @@ class NexusCrewBot:
                             active_task_ids=self._runner.active_task_ids(),
                             notify_chat=False,
                         )
+                        await self._orch.proactive_tick(
+                            self._make_send,
+                            active_task_ids=self._runner.active_task_ids(),
+                            waiting_task_ids=self._runner.waiting_task_ids(),
+                            notify_chat=False,
+                        )
                 except Exception:
                     pass
                 await asyncio.sleep(15)
@@ -959,10 +1359,155 @@ class NexusCrewBot:
             return {"error": f"task not found: {task_id}"}
         if path.startswith("/artifacts/"):
             task_id = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                task = self._orch.task_tracker.get(chat_id, task_id)
+                if task is not None:
+                    try:
+                        return {"artifacts": self._orch.artifacts_summary(task_id, chat_id=chat_id)}
+                    except TypeError:
+                        return {"artifacts": self._orch.artifacts_summary(task_id)}
             return {"artifacts": self._orch.artifacts_summary(task_id)}
         if path.startswith("/trace/"):
             task_id = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                task = self._orch.task_tracker.get(chat_id, task_id)
+                if task is not None:
+                    try:
+                        return {"trace": self._orch.trace_summary(task_id, chat_id=chat_id)}
+                    except TypeError:
+                        return {"trace": self._orch.trace_summary(task_id)}
             return {"trace": self._orch.trace_summary(task_id)}
+        if path.startswith("/presence"):
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            return {
+                "presence": self._orch.agent_presence(
+                    chat_id,
+                    inflight_task_ids=self._runner.active_task_ids(),
+                    waiting_task_ids=self._runner.waiting_task_ids(),
+                )
+            }
+        if path.startswith("/queues"):
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            return {
+                "queues": self._orch.agent_queue_summaries(
+                    chat_id,
+                    inflight_task_ids=self._runner.active_task_ids(),
+                    waiting_task_ids=self._runner.waiting_task_ids(),
+                )
+            }
+        if path.startswith("/lanes"):
+            if hasattr(self._orch, "lane_runtime_summaries"):
+                return {
+                    "lanes": [
+                        row
+                        for lane_chat_id in sorted(self._orch.task_tracker._tasks)
+                        for row in self._orch.lane_runtime_summaries(
+                            lane_chat_id,
+                            self._runner.lane_summaries(),
+                            inflight_task_ids=self._runner.active_task_ids(),
+                            waiting_task_ids=self._runner.waiting_task_ids(),
+                        )
+                    ]
+                }
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            return {
+                "lanes": [
+                    row for row in self._runner.lane_summaries()
+                    if not chat_id or row.get("chat_id") in (0, chat_id)
+                ]
+            }
+        if path.startswith("/lane/"):
+            lane_key = path.split("/", 2)[2]
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            if lane_key.startswith("chat:"):
+                parts = lane_key.split(":", 2)
+                if len(parts) >= 2:
+                    try:
+                        chat_id = int(parts[1])
+                    except ValueError:
+                        pass
+            if hasattr(self._orch, "lane_summary"):
+                return {
+                    "lane": self._orch.lane_summary(
+                        chat_id,
+                        lane_key,
+                        lane_summaries=self._runner.lane_summaries(),
+                        inflight_task_ids=self._runner.active_task_ids(),
+                        waiting_task_ids=self._runner.waiting_task_ids(),
+                    )
+                }
+            return {"error": f"lane not found: {lane_key}"}
+        if path.startswith("/lane-trace/"):
+            lane_key = path.split("/", 2)[2]
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            if lane_key.startswith("chat:"):
+                parts = lane_key.split(":", 2)
+                if len(parts) >= 2:
+                    try:
+                        chat_id = int(parts[1])
+                    except ValueError:
+                        pass
+            if hasattr(self._orch, "lane_trace_summary"):
+                return {
+                    "lane_trace": self._orch.lane_trace_summary(
+                        chat_id,
+                        lane_key,
+                        lane_summaries=self._runner.lane_summaries(),
+                    )
+                }
+            return {"error": f"lane trace not available: {lane_key}"}
+        if path.startswith("/proactive"):
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            return {
+                "proactive": self._orch.proactive_recommendations(
+                    chat_id,
+                    inflight_task_ids=self._runner.active_task_ids(),
+                    waiting_task_ids=self._runner.waiting_task_ids(),
+                )
+            }
+        if path.startswith("/control"):
+            chat_id = next(iter(self._orch.task_tracker._tasks), 0)
+            return {
+                "control_plane": self._orch.control_plane_summary(
+                    chat_id,
+                    inflight_task_ids=self._runner.active_task_ids(),
+                    waiting_task_ids=self._runner.waiting_task_ids(),
+                )
+            }
+        if path.startswith("/sessions/"):
+            session_key = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                summary = self._orch.session_summary(chat_id, session_key)
+                if not summary.startswith("未找到 session"):
+                    return {"session": summary}
+            return {"error": f"session not found: {session_key}"}
+        if path.startswith("/gates/"):
+            task_id = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                task = self._orch.task_tracker.get(chat_id, task_id)
+                if task is not None:
+                    try:
+                        return {"gates": self._orch.gate_summary(task_id, chat_id=chat_id)}
+                    except TypeError:
+                        return {"gates": self._orch.gate_summary(task_id)}
+            return {"gates": self._orch.gate_summary(task_id)}
+        if path.startswith("/continuation/"):
+            task_id = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                task = self._orch.task_tracker.get(chat_id, task_id)
+                if task is not None:
+                    try:
+                        return {"continuation": self._orch.continuation_summary(task_id, chat_id=chat_id)}
+                    except TypeError:
+                        return {"continuation": self._orch.continuation_summary(task_id)}
+            return {"continuation": self._orch.continuation_summary(task_id)}
+        if path.startswith("/families/"):
+            family_id = path.split("/", 2)[2]
+            for chat_id in self._orch.task_tracker._tasks:
+                summary = self._orch.family_summary(chat_id, family_id)
+                if not summary.startswith("未找到 family"):
+                    return {"family": summary}
+            return {"error": f"family not found: {family_id}"}
         if path.startswith("/runs/"):
             run_id = path.split("/", 2)[2]
             return {"events": self._orch.state_store.list_run_events(run_id)}

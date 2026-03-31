@@ -42,6 +42,7 @@ def test_recovery_manager_recovers_interrupted_job(tmp_path: Path):
         chat_id=1,
         task_id=task.id,
         run_id="run-1",
+        lane_key="chat:1:task:T-0001",
     )
     runner._counter = 1
     runner._counter = 1
@@ -55,15 +56,15 @@ def test_recovery_manager_recovers_interrupted_job(tmp_path: Path):
 
     original_resume = runner.resume_existing
 
-    def capture_resume(job_id, coro):
-        recovered_jobs.append(job_id)
-        return original_resume(job_id, coro)
+    def capture_resume(job_id, coro, lane_key=""):
+        recovered_jobs.append((job_id, lane_key))
+        return original_resume(job_id, coro, lane_key=lane_key)
 
     runner.resume_existing = capture_resume
 
     asyncio.run(RecoveryManager(runner, orchestrator).recover(send_factory))
 
-    assert recovered_jobs == ["BG-0001"]
+    assert recovered_jobs == [("BG-0001", "chat:1:task:T-0001")]
     assert runner.get("BG-0001").status in ("running", "completed", "failed", "cancelled")
 
 

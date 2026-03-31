@@ -113,6 +113,7 @@ class Orchestrator:
         self._stuck_reports: dict[tuple[int, str], object] = {}
         self._ci_overrides: dict[str, CIResult] = {}
         self._task_watchdog_sent_at: dict[tuple[int, str], float] = {}
+        self._proactive_sent_at: dict[tuple[int, str], float] = {}
         self._restore_tasks_from_state()
 
     # ── history helpers ───────────────────────────────────────────────
@@ -125,6 +126,22 @@ class Orchestrator:
     def reset_history(self, chat_id: int):
         self._histories.pop(chat_id, None)
         self._dev_retries.pop(chat_id, None)
+
+    def checkpoint_active_continuations(self, chat_id: int) -> list[str]:
+        saved: list[str] = []
+        for task in self.task_tracker.list_active(chat_id):
+            run_id = self._task_run_ids.get((chat_id, task.id), self._new_run_id())
+            self._append_continuation_artifact(task, run_id)
+            self._record_event(
+                run_id,
+                chat_id,
+                "continuation_checkpointed",
+                "system",
+                task,
+                {"task_id": task.id, "reason": "manual_reset"},
+            )
+            saved.append(task.id)
+        return saved
 
     # ── main entry point ──────────────────────────────────────────────
     async def run_chain(
@@ -141,8 +158,18 @@ class Orchestrator:
         Run the agent chain starting from initial_agent (or router default).
         Each agent reply is scanned for @mentions to route the next hop.
         """
-        agent = initial_agent or self.router.detect_first(message) \
-                              or self.router.default_agent()
+        routed_initial = self.router.detect_first_routed(message) if initial_agent is None else None
+        agent = initial_agent
+        if agent is None and routed_initial:
+            if routed_initial["kind"] == "role_alias":
+                agent = self._pick_best_agent_for_role(
+                    routed_initial["role"],
+                    chat_id,
+                ) or routed_initial["agent"]
+            else:
+                agent = routed_initial["agent"]
+        if agent is None:
+            agent = self.router.default_agent()
         if not agent:
             await send("[NexusCrew] 没有可用的 Agent，请先使用 /crew 编组。")
             return
@@ -331,6 +358,7 @@ class Orchestrator:
                     summary=review_packet.splitlines()[0][:120] if review_packet else "dev handoff",
                     content=review_packet,
                 ))
+            self._append_gate_decision_artifact(task, run_id, agent, reply)
             await self.github_sync.mirror_comment(task, agent.name, mirror_reply)
             await self.slack_sync.mirror_comment(task, agent.name, mirror_reply)
             self.scoped_memory.append(f"task:{task.id}", agent.name, reply[:500], importance=2)
@@ -379,15 +407,23 @@ class Orchestrator:
             )
 
             routing_reply = public_reply if agent.role == "dev" else reply
+            self._update_task_blocked_reason(task, agent, reply, routing_reply, artifacts)
             self._advance_task_after_reply(task, agent, reply, routing_reply=routing_reply)
             await self._maybe_sync_pr(chat_id, task, routing_reply)
             self._update_stuck_report(chat_id, task.id)
 
             # Detect next agent
-            next_agents = [
-                candidate for candidate in self.router.detect_all(routing_reply)
-                if candidate.name != agent.name
-            ]
+            next_agents = []
+            for routed in self.router.detect_all_routed(routing_reply):
+                candidate = routed["agent"]
+                if routed["kind"] == "role_alias":
+                    candidate = self._pick_best_agent_for_role(
+                        routed["role"],
+                        chat_id,
+                        exclude_name=agent.name,
+                    ) or candidate
+                if candidate.name != agent.name:
+                    next_agents.append(candidate)
             if agent.role == "pm" and self._is_status_query(message):
                 next_agents = []
             if not next_agents:
@@ -473,6 +509,7 @@ class Orchestrator:
             summary=f"run completed by {agent.name}",
             content=f"final status={task.status.value}",
         ))
+        self._append_continuation_artifact(task, run_id)
         self._save_checkpoint(
             run_id=run_id,
             chat_id=chat_id,
@@ -501,6 +538,43 @@ class Orchestrator:
             ):
                 return True
         return False
+
+    def _pick_best_agent_for_role(
+        self,
+        role: str,
+        chat_id: int,
+        exclude_name: str = "",
+    ):
+        candidates = self.registry.list_by_role(role) if hasattr(self.registry, "list_by_role") else []
+        if not candidates:
+            return self.registry.get_by_role(role)
+        waiting = set()
+        inflight = set()
+        load_by_agent = {
+            row["name"]: row
+            for row in self.agent_presence(
+                chat_id,
+                inflight_task_ids=inflight,
+                waiting_task_ids=waiting,
+            )
+        }
+
+        def score(agent):
+            row = load_by_agent.get(agent.name, {})
+            presence = row.get("presence", "idle")
+            presence_score = {
+                "idle": 0,
+                "active": 1,
+                "waiting": 2,
+                "busy": 3,
+                "blocked": 4,
+                "stale": 5,
+            }.get(presence, 9)
+            queue = row.get("queue_size", 0)
+            penalty = 100 if exclude_name and agent.name == exclude_name else 0
+            return (penalty + presence_score, queue, agent.name)
+
+        return sorted(candidates, key=score)[0]
 
     def _find_recent_dev(self, history: list[dict]):
         # Task 3.2 完成: 从历史中回溯最近一个 Dev，给 review 指标归因。
@@ -601,14 +675,14 @@ class Orchestrator:
             )
             if any(fragment in text for fragment in progress_fragments):
                 return True
+            substantive_markers = ("Conditional Go", "Go", "No-Go", "NO-GO", "风险", "覆盖", "验证", "阻断", "结论")
+            if any(marker in text for marker in substantive_markers):
+                return False
             low_signal_replies = (
                 "ok", "收到", "在", "收到，先测一下", "收到，稍后给结论",
                 "收到，先验证一下", "收到，测试中。",
             )
-            if normalized in low_signal_replies or len(text) < 120:
-                return True
-            substantive_markers = ("Go", "No-Go", "NO-GO", "风险", "覆盖", "验证", "阻断", "结论")
-            return not any(marker in text for marker in substantive_markers)
+            return normalized in low_signal_replies or len(text) < 120
         return False
 
     def _build_substantive_retry_prompt(self, agent, message: str, reply: str) -> str:
@@ -795,6 +869,49 @@ class Orchestrator:
                     self.state_store.save_task(chat_id, task)
         return alerts
 
+    async def proactive_tick(
+        self,
+        send_factory,
+        active_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+        notify_chat: bool = False,
+    ) -> list[dict]:
+        emitted: list[dict] = []
+        active_task_ids = set(active_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        for chat_id in self.task_tracker._tasks:
+            recs = self.proactive_recommendations(
+                chat_id,
+                inflight_task_ids=active_task_ids,
+                waiting_task_ids=waiting_task_ids,
+            )
+            if not recs:
+                continue
+            now = time.monotonic()
+            deduped: list[dict] = []
+            for rec in recs:
+                signature = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+                key = (chat_id, signature)
+                if now - self._proactive_sent_at.get(key, 0) < self.task_watchdog_interval_seconds:
+                    continue
+                self._proactive_sent_at[key] = now
+                deduped.append(rec)
+            if not deduped:
+                continue
+            for rec in deduped:
+                self._record_event(
+                    self._new_run_id(),
+                    chat_id,
+                    "proactive_recommendation",
+                    "system",
+                    None,
+                    rec,
+                )
+            emitted.extend(deduped)
+            if notify_chat:
+                await send_factory(chat_id)(self._format_proactive_recommendations(deduped))
+        return emitted
+
     def _build_task_watchdog_digest(
         self,
         stale_running: list[tuple[Task, float]],
@@ -822,6 +939,49 @@ class Orchestrator:
         pm = self.router.default_agent()
         if pm:
             lines.append(f"@{pm.name} 请推进、改派或降级方案。")
+        return "\n".join(lines)
+
+    def _format_proactive_recommendations(self, recs: list[dict]) -> str:
+        lines = ["🤖 Proactive Recommendations", ""]
+        for item in recs[:6]:
+            if item["type"] == "family_escalation":
+                lines.append(f"- family {item['family_id']}: {item['state']} / {item['reason']}")
+            elif item["type"] == "family_completion":
+                lines.append(f"- family {item['family_id']}: ready / {item['reason']}")
+            elif item["type"] == "family_ready_to_close":
+                lines.append(f"- family {item['family_id']}: closeout / {item['reason']}")
+            elif item["type"] == "agent_rebalance":
+                lines.append(f"- @{item['agent']}: {item['reason']} ({item['count']})")
+            elif item["type"] == "idle_capacity":
+                lines.append(
+                    f"- @{item['source_agent']}: {item['reason']} -> available {', '.join('@' + name for name in item['idle_agents'])}"
+                )
+            elif item["type"] == "continuation_next_action":
+                lines.append(
+                    f"- family {item['family_id']}: next -> {', '.join(item['actions'])}"
+                )
+            elif item["type"] == "session_completion":
+                lines.append(f"- session {item['session_key']}: {item['state']} / {item['reason']}")
+            elif item["type"] == "session_ready_to_close":
+                lines.append(f"- session {item['session_key']}: closeout / {item['reason']}")
+            elif item["type"] == "lane_congestion":
+                lines.append(f"- lane {item['lane_key']}: congested / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_backlog":
+                lines.append(f"- lane {item['lane_key']}: backlog / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_human_decision":
+                lines.append(f"- lane {item['lane_key']}: human / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_unassigned":
+                lines.append(f"- lane {item['lane_key']}: unassigned / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_multi_owner":
+                lines.append(f"- lane {item['lane_key']}: multi-owner / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_ready_to_close":
+                lines.append(f"- lane {item['lane_key']}: closeout / {item['reason']}")
+            elif item["type"] == "lane_partial_completion":
+                lines.append(f"- lane {item['lane_key']}: partial / {item['reason']}")
+            elif item["type"] == "lane_review_queue":
+                lines.append(f"- lane {item['lane_key']}: review / waiting={item['waiting']} / {item['reason']}")
+            elif item["type"] == "lane_quality_queue":
+                lines.append(f"- lane {item['lane_key']}: qa / waiting={item['waiting']} / {item['reason']}")
         return "\n".join(lines)
 
     async def _build_public_reply(self, chat_id: int, task, agent, reply: str, artifacts) -> str:
@@ -1068,8 +1228,474 @@ class Orchestrator:
                 )
         return "\n".join(lines) if lines else "(无)"
 
-    def format_status(self, chat_id: int) -> str:
-        return self.task_tracker.format_status(chat_id)
+    def format_status(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> str:
+        return self.task_tracker.format_status(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            task_stage_sla_seconds=self.task_stage_sla_seconds,
+        )
+
+    def agent_presence(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> list[dict]:
+        inflight_task_ids = set(inflight_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        tasks_by_agent: dict[str, list[Task]] = {}
+        for task in self.task_tracker.list_active(chat_id):
+            if task.assigned_to:
+                tasks_by_agent.setdefault(task.assigned_to, []).append(task)
+
+        agents = []
+        for item in self.registry.list_all():
+            name = item["name"]
+            assigned = tasks_by_agent.get(name, [])
+            presence = "idle"
+            current_task_id = ""
+            states: list[str] = []
+            if assigned:
+                current_task_id = assigned[-1].id
+                states = [
+                    self.task_tracker._runtime_state_label(
+                        task,
+                        inflight_task_ids=inflight_task_ids,
+                        waiting_task_ids=waiting_task_ids,
+                        task_stage_sla_seconds=self.task_stage_sla_seconds,
+                    )
+                    for task in assigned
+                ]
+                if "blocked" in states:
+                    presence = "blocked"
+                elif "inflight" in states:
+                    presence = "busy"
+                elif "waiting" in states:
+                    presence = "waiting"
+                elif "stale" in states:
+                    presence = "stale"
+                else:
+                    presence = "active"
+            agents.append(
+                {
+                    **item,
+                    "presence": presence,
+                    "queue_size": len(assigned),
+                    "family_count": len({getattr(task, "family_id", task.id) or task.id for task in assigned}),
+                    "current_task_id": current_task_id,
+                    "blocked_count": states.count("blocked"),
+                    "inflight_count": states.count("inflight"),
+                    "waiting_count": states.count("waiting"),
+                    "stale_count": states.count("stale"),
+                    "load": "idle" if not assigned else "heavy" if len(assigned) >= 3 else "active",
+                }
+            )
+        return agents
+
+    def agent_queue_summaries(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> list[dict]:
+        inflight_task_ids = set(inflight_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        rows = []
+        for item in self.registry.list_all():
+            queue = self.task_tracker.agent_queue(
+                chat_id,
+                item["name"],
+                inflight_task_ids=inflight_task_ids,
+                waiting_task_ids=waiting_task_ids,
+                task_stage_sla_seconds=self.task_stage_sla_seconds,
+            )
+            enriched = []
+            for entry in queue:
+                task = self.task_tracker.get(chat_id, entry["task_id"])
+                enriched.append(
+                    {
+                        **entry,
+                        "session_key": getattr(task, "session_key", "") if task else "",
+                        "next_action": self._latest_continuation_next_action_for_chat(entry["task_id"], chat_id),
+                    }
+                )
+            rows.append({"agent": item["name"], "queue": enriched})
+        return rows
+
+    def _family_rollups_with_actions(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> list[dict]:
+        rollups = self.task_tracker.family_rollups(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            task_stage_sla_seconds=self.task_stage_sla_seconds,
+        )
+        for item in rollups:
+            item["next_actions"] = sorted(
+                {
+                    self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                    for task in item["members"]
+                    if self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                }
+            )
+        return rollups
+
+    def _session_rollups_with_actions(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> list[dict]:
+        rollups = self.task_tracker.session_rollups(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            task_stage_sla_seconds=self.task_stage_sla_seconds,
+        )
+        for item in rollups:
+            item["next_actions"] = sorted(
+                {
+                    self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                    for task in item["members"]
+                    if self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                }
+            )
+        return rollups
+
+    def lane_runtime_summaries(
+        self,
+        chat_id: int,
+        lane_summaries: list[dict],
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> list[dict]:
+        inflight_task_ids = set(inflight_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        rows: list[dict] = []
+        for lane in lane_summaries:
+            if chat_id and lane.get("chat_id") not in (0, chat_id):
+                continue
+            jobs = list(lane.get("jobs", []))
+            members = self.task_tracker.session_members(chat_id, lane.get("lane_key", ""), include_done=True) if lane.get("lane_key") else []
+            head = next((job for job in jobs if job.get("status") in {"pending", "running"}), None)
+            if head is None:
+                head = next((job for job in jobs if job.get("status") == "waiting"), None)
+            head_task_id = head.get("task_id", "") if head else ""
+            head_task = self.task_tracker.get(chat_id, head_task_id) if head_task_id else None
+            next_action = self._latest_continuation_next_action_for_chat(head_task_id, chat_id) if head_task_id else ""
+            blocked_reason = getattr(head_task, "blocked_reason", "") if head_task else ""
+            blocked_reasons = sorted({getattr(task, "blocked_reason", "") for task in members if getattr(task, "blocked_reason", "")})
+            active_agents = sorted({task.assigned_to for task in members if getattr(task, "assigned_to", "")})
+            next_actions = sorted(
+                {
+                    self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                    for task in members
+                    if self._latest_continuation_next_action_for_chat(task.id, chat_id)
+                }
+            )
+            family_ids = sorted({getattr(task, "family_id", "") or task.id for task in members})
+            runtime_state = (
+                self.task_tracker._runtime_state_label(
+                    head_task,
+                    inflight_task_ids=inflight_task_ids,
+                    waiting_task_ids=waiting_task_ids,
+                    task_stage_sla_seconds=self.task_stage_sla_seconds,
+                )
+                if head_task is not None
+                else ""
+            )
+            ready_to_close = self.task_tracker.session_ready_to_close(chat_id, lane["lane_key"]) if lane.get("lane_key") else False
+            completion_state = self.task_tracker.session_completion_state(chat_id, lane["lane_key"]) if lane.get("lane_key") else "unknown"
+            state = lane.get("state", "")
+            if blocked_reason and lane.get("waiting", 0) > 0:
+                state = "blocked"
+            owner = getattr(head_task, "assigned_to", "") if head_task is not None else ""
+            head_gate = self._latest_gate_summary_for_chat(head_task_id, chat_id) if head_task_id else ""
+            recent_route = self._latest_route_summary_for_chat(head_task_id, chat_id) if head_task_id else ""
+            rows.append(
+                {
+                    **lane,
+                    "state": state,
+                    "head_task_id": head_task_id,
+                    "head_runtime_state": runtime_state,
+                    "head_blocked_reason": blocked_reason,
+                    "next_action": next_action,
+                    "next_actions": next_actions,
+                    "completion_state": completion_state,
+                    "blocked_reasons": blocked_reasons,
+                    "active_agents": active_agents,
+                    "family_ids": family_ids,
+                    "member_count": len(members),
+                    "owner": owner,
+                    "head_gate": head_gate,
+                    "recent_route": recent_route,
+                    "ready_to_close": ready_to_close,
+                }
+            )
+        return rows
+
+    def lane_summary(
+        self,
+        chat_id: int,
+        lane_key: str,
+        lane_summaries: list[dict] | None = None,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+    ) -> str:
+        rows = self.lane_runtime_summaries(
+            chat_id,
+            lane_summaries or [],
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        lane = next((item for item in rows if item.get("lane_key") == lane_key), None)
+        if lane is None:
+            return f"未找到 lane: {lane_key}"
+        lines = [f"Lane: {lane_key}", ""]
+        lines.append(f"State: {lane.get('state', 'active')}")
+        lines.append(f"Completion: {lane.get('completion_state', 'unknown')}")
+        lines.append(f"Inflight: {lane.get('inflight', 0)}")
+        lines.append(f"Waiting: {lane.get('waiting', 0)}")
+        lines.append(f"Members: {lane.get('member_count', 0)}")
+        lines.append(f"Owner: @{lane.get('owner', '')}" if lane.get("owner") else "Owner: (none)")
+        lines.append(f"Families: {', '.join(lane.get('family_ids', [])) or '(none)'}")
+        lines.append(f"Head Job: {lane.get('head_job_id', '(none)') or '(none)'}")
+        lines.append(f"Head Task: {lane.get('head_task_id', '(none)') or '(none)'}")
+        lines.append(f"Head Gate: {lane.get('head_gate', '(none)') or '(none)'}")
+        lines.append(f"Recent Route: {lane.get('recent_route', '(none)') or '(none)'}")
+        lines.append(f"Agents: {', '.join('@' + name for name in lane.get('active_agents', [])) or '(none)'}")
+        lines.append(f"Blocked: {lane.get('head_blocked_reason', '(none)') or '(none)'}")
+        lines.append(f"Blocked Reasons: {', '.join(lane.get('blocked_reasons', [])) or '(none)'}")
+        lines.append(f"Next Action: {lane.get('next_action', '(none)') or '(none)'}")
+        lines.append(f"Next Actions: {', '.join(lane.get('next_actions', [])) or '(none)'}")
+        lines.append(f"Ready To Close: {'yes' if lane.get('ready_to_close') else 'no'}")
+        lines.append("")
+        for job in lane.get("jobs", [])[:8]:
+            lines.append(
+                f"- {job['id']} status={job['status']} task={job.get('task_id', '(none)') or '(none)'} label={job.get('label', '')}"
+            )
+        lines.extend(["", self.lane_trace_summary(chat_id, lane_key, lane_summaries=lane_summaries)])
+        return "\n".join(lines)
+
+    def lane_trace_summary(
+        self,
+        chat_id: int,
+        lane_key: str,
+        lane_summaries: list[dict] | None = None,
+    ) -> str:
+        rows = lane_summaries or []
+        lane = next((item for item in rows if item.get("lane_key") == lane_key and item.get("chat_id") in (0, chat_id)), None)
+        if lane is None:
+            return "(无 lane trace)"
+        from .trace.store import TraceStore
+        task_ids = [task_id for task_id in lane.get("task_ids", []) if task_id]
+        return TraceStore(self.event_store).format_lane_timeline(lane_key, chat_id, task_ids)
+
+    def proactive_recommendations(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+        lane_summaries: list[dict] | None = None,
+    ) -> list[dict]:
+        inflight_task_ids = set(inflight_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        recs: list[dict] = []
+        for family in self._family_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        ):
+            reason = self._family_escalation_reason(family)
+            if reason:
+                recs.append(
+                    {
+                        "type": "family_escalation",
+                        "family_id": family["family_id"],
+                        "state": family["state"],
+                        "reason": reason,
+                    }
+                )
+            if family.get("completion_state") == "partial" and family["state"] not in {"blocked", "stale"}:
+                recs.append(
+                    {
+                        "type": "family_completion",
+                        "family_id": family["family_id"],
+                        "state": family["state"],
+                        "reason": "partial_family_completion",
+                    }
+                )
+            if family.get("ready_to_close"):
+                recs.append(
+                    {
+                        "type": "family_ready_to_close",
+                        "family_id": family["family_id"],
+                        "state": family["state"],
+                        "reason": "gate_and_acceptance_closeout",
+                    }
+                )
+            next_actions = family.get("next_actions", [])
+            if next_actions:
+                recs.append(
+                    {
+                        "type": "continuation_next_action",
+                        "family_id": family["family_id"],
+                        "actions": next_actions[:3],
+                    }
+                )
+        idle_agents = []
+        for row in self.agent_queue_summaries(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        ):
+            blocked = [item for item in row["queue"] if item["runtime_state"] == "blocked"]
+            if len(blocked) >= 2:
+                recs.append(
+                    {
+                        "type": "agent_rebalance",
+                        "agent": row["agent"],
+                        "reason": "multiple_blocked_tasks",
+                        "count": len(blocked),
+                    }
+                )
+            if not row["queue"]:
+                idle_agents.append(row["agent"])
+        if idle_agents:
+            for row in self.agent_queue_summaries(
+                chat_id,
+                inflight_task_ids=inflight_task_ids,
+                waiting_task_ids=waiting_task_ids,
+            ):
+                if len(row["queue"]) >= 2:
+                    recs.append(
+                        {
+                            "type": "idle_capacity",
+                            "source_agent": row["agent"],
+                            "idle_agents": idle_agents[:3],
+                            "reason": "rebalance_candidate",
+                        }
+                    )
+                    break
+        for session in self._session_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        ):
+            if session.get("completion_state") == "partial":
+                recs.append(
+                    {
+                        "type": "session_completion",
+                        "session_key": session["session_key"],
+                        "state": session["state"],
+                        "reason": "partial_session_completion",
+                    }
+                )
+            if session.get("ready_to_close"):
+                recs.append(
+                    {
+                        "type": "session_ready_to_close",
+                        "session_key": session["session_key"],
+                        "state": session["state"],
+                        "reason": "session_closeout_ready",
+                    }
+                )
+        for lane in self.lane_runtime_summaries(
+            chat_id,
+            lane_summaries or [],
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        ):
+            if lane.get("inflight", 0) > 0 and lane.get("waiting", 0) > 0:
+                recs.append(
+                    {
+                        "type": "lane_congestion",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "serialized_session_backlog",
+                    }
+                )
+            elif lane.get("waiting", 0) >= 2:
+                recs.append(
+                    {
+                        "type": "lane_backlog",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "queued_session_work",
+                    }
+                )
+            if lane.get("completion_state") == "partial" and not lane.get("ready_to_close"):
+                recs.append(
+                    {
+                        "type": "lane_partial_completion",
+                        "lane_key": lane["lane_key"],
+                        "reason": "partial_lane_completion",
+                    }
+                )
+            if lane.get("head_blocked_reason") == "human_input_required":
+                recs.append(
+                    {
+                        "type": "lane_human_decision",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "head_task_needs_human_decision",
+                    }
+                )
+            if not lane.get("owner") and lane.get("waiting", 0) > 0:
+                recs.append(
+                    {
+                        "type": "lane_unassigned",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "head_task_has_no_owner",
+                    }
+                )
+            if len(lane.get("active_agents", [])) > 1 and lane.get("waiting", 0) > 0:
+                recs.append(
+                    {
+                        "type": "lane_multi_owner",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "multi_owner_lane_backlog",
+                    }
+                )
+            if lane.get("ready_to_close"):
+                recs.append(
+                    {
+                        "type": "lane_ready_to_close",
+                        "lane_key": lane["lane_key"],
+                        "reason": "session_closeout_ready",
+                    }
+                )
+            if lane.get("next_action") == "architect review" and lane.get("waiting", 0) > 0:
+                recs.append(
+                    {
+                        "type": "lane_review_queue",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "review_step_queued",
+                    }
+                )
+            if lane.get("next_action") == "qa quality gate" and lane.get("waiting", 0) > 0:
+                recs.append(
+                    {
+                        "type": "lane_quality_queue",
+                        "lane_key": lane["lane_key"],
+                        "waiting": lane.get("waiting", 0),
+                        "reason": "qa_step_queued",
+                    }
+                )
+        return recs
 
     def format_task_detail(self, chat_id: int, task_id: str) -> str:
         task = self.task_tracker.get(chat_id, task_id)
@@ -1082,8 +1708,15 @@ class Orchestrator:
         merge_gate = self.merge_gate.build(task, ci_result, approvals, artifacts)
         parts = [
             f"任务: {task.id}",
+            f"Session: {getattr(task, 'session_key', '') or '(none)'}",
             f"状态: {task.status.value}",
             f"负责人: @{task.assigned_to or '未分配'}",
+            f"Family: {getattr(task, 'family_id', '') or task.id}",
+            f"Parent: {getattr(task, 'parent_task_id', '') or '(none)'}",
+            f"阻塞: {getattr(task, 'blocked_reason', '') or '(无)'}",
+            f"最近路由: {self._latest_route_summary_for_chat(task.id, chat_id)}",
+            f"最近 Gate: {self._latest_gate_summary_for_chat(task.id, chat_id)}",
+            f"续接摘要: {self._latest_continuation_summary_for_chat(task.id, chat_id)}",
             f"分支: {task.branch_name or '(未创建)'}",
             f"GitHub Issue: {task.github_issue_url or '(未同步)'}",
             f"GitHub PR: {task.github_pr_url or '(未创建)'}",
@@ -1091,36 +1724,658 @@ class Orchestrator:
             f"CI: {ci_result.summary}",
             f"Merge Gate: {merge_gate.summary}",
             "",
-            self.trace_summary(task_id),
+            self.trace_summary(task_id, chat_id=chat_id),
             "",
-            self.artifact_store.format_for_task(task_id),
+            self.artifact_store.format_for_task(task_id, chat_id=chat_id),
         ]
         report = self._stuck_reports.get((chat_id, task_id))
         if report:
             parts.extend(["", f"Stuck Detector: {report.summary}"])
         return "\n".join(parts)
 
-    def doctor_report(self, chat_id: int) -> str:
+    def doctor_report(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+        lane_summaries: list[dict] | None = None,
+    ) -> str:
         agent_names = [item["name"] for item in self.registry.list_all()]
         pending = self.executor.list_pending_approvals()
+        blocked_tasks = [
+            task
+            for task in self.task_tracker.list_active(chat_id)
+            if getattr(task, "blocked_reason", "")
+        ]
         lines = [
             "🩺 NexusCrew Doctor",
             "",
-            self.task_tracker.format_status(chat_id),
+            self.task_tracker.format_status(
+                chat_id,
+                inflight_task_ids=inflight_task_ids or set(),
+                waiting_task_ids=waiting_task_ids or set(),
+                task_stage_sla_seconds=self.task_stage_sla_seconds,
+            ),
             "",
             f"待审批动作: {len(pending)}",
             build_trend_report(self.metrics_store, agent_names),
             "",
             recommend_staffing(self.metrics_store, agent_names),
         ]
+        presence_rows = self.agent_presence(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        if presence_rows:
+            lines.extend(["", "Agent Presence:"])
+            for row in presence_rows:
+                current = f" / {row['current_task_id']}" if row["current_task_id"] else ""
+                lines.append(
+                    f"  @{row['name']}: {row['presence']} / load={row['load']} / queue={row['queue_size']} / families={row['family_count']} / blocked={row['blocked_count']} / inflight={row['inflight_count']} / waiting={row['waiting_count']}{current}"
+                )
+        if blocked_tasks:
+            lines.extend(["", "Blocked Tasks:"])
+            for task in blocked_tasks[:5]:
+                lines.append(
+                    f"  {task.id}: {task.blocked_reason} / {self._latest_route_summary_for_chat(task.id, chat_id)}"
+                )
+        family_rollups = self._family_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        if family_rollups:
+            lines.extend(["", "🧬 Task Families:"])
+            for item in family_rollups[:6]:
+                members = ", ".join(task.id for task in item["members"])
+                next_actions = ", ".join(item.get("next_actions", [])[:2]) or "(none)"
+                blocked = ", ".join(item.get("blocked_reasons", [])) or "(none)"
+                lines.append(
+                    f"  {item['family_id']}: {item['state']} / {item['completion_state']} / blocked={blocked} / next={next_actions} / {members}"
+                )
+        session_rollups = self._session_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        if session_rollups:
+            lines.extend(["", "🧩 Sessions:"])
+            for item in session_rollups[:6]:
+                members = ", ".join(task.id for task in item["members"])
+                next_actions = ", ".join(item.get("next_actions", [])[:2]) or "(none)"
+                blocked = ", ".join(item.get("blocked_reasons", [])) or "(none)"
+                lines.append(
+                    f"  {item['session_key']}: {item['state']} / {item['completion_state']} / blocked={blocked} / next={next_actions} / {members}"
+                )
+        queue_rows = self.agent_queue_summaries(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        if queue_rows:
+            lines.extend(["", "Agent Queues:"])
+            for row in queue_rows:
+                if not row["queue"]:
+                    lines.append(f"  @{row['agent']}: (empty)")
+                    continue
+                preview = ", ".join(
+                    f"{item['task_id']}:{item['runtime_state']}" + (f"->{item['next_action']}" if item.get("next_action") else "")
+                    for item in row["queue"][:4]
+                )
+                lines.append(f"  @{row['agent']}: {preview}")
+        filtered_lanes = self.lane_runtime_summaries(
+            chat_id,
+            lane_summaries or [],
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        if filtered_lanes:
+            lines.extend(["", "🛣️ Session Lanes:"])
+            for lane in filtered_lanes[:6]:
+                lines.append(
+                    f"  {lane['lane_key']}: {lane.get('state', 'active')} / {lane.get('completion_state', 'unknown')} / inflight={lane.get('inflight', 0)} / waiting={lane.get('waiting', 0)} / owner={'@' + lane['owner'] if lane.get('owner') else '(none)'} / head={lane.get('head_job_id', '(none)')} / task={lane.get('head_task_id', '(none)')} / gate={lane.get('head_gate', '(none)') or '(none)'} / blocked={lane.get('head_blocked_reason', '(none)') or '(none)'} / next={lane.get('next_action', '(none)') or '(none)'}"
+                )
+        recommendations = self.proactive_recommendations(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            lane_summaries=lane_summaries,
+        )
+        if recommendations:
+            lines.extend(["", "Proactive Recommendations:"])
+            for item in recommendations[:6]:
+                if item["type"] == "family_escalation":
+                    lines.append(
+                        f"  family {item['family_id']}: {item['state']} / {item['reason']}"
+                    )
+                elif item["type"] == "family_completion":
+                    lines.append(
+                        f"  family {item['family_id']}: ready / {item['reason']}"
+                    )
+                elif item["type"] == "agent_rebalance":
+                    lines.append(
+                        f"  @{item['agent']}: {item['reason']} ({item['count']})"
+                    )
+                elif item["type"] == "idle_capacity":
+                    lines.append(
+                        f"  @{item['source_agent']}: {item['reason']} -> available {', '.join('@' + name for name in item['idle_agents'])}"
+                    )
+                elif item["type"] == "continuation_next_action":
+                    lines.append(
+                        f"  family {item['family_id']}: next -> {', '.join(item['actions'])}"
+                    )
+                elif item["type"] == "session_completion":
+                    lines.append(
+                        f"  session {item['session_key']}: {item['state']} / {item['reason']}"
+                    )
+                elif item["type"] == "family_ready_to_close":
+                    lines.append(
+                        f"  family {item['family_id']}: closeout / {item['reason']}"
+                    )
+                elif item["type"] == "session_ready_to_close":
+                    lines.append(
+                        f"  session {item['session_key']}: closeout / {item['reason']}"
+                    )
+                elif item["type"] == "lane_congestion":
+                    lines.append(
+                        f"  lane {item['lane_key']}: waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_backlog":
+                    lines.append(
+                        f"  lane {item['lane_key']}: waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_human_decision":
+                    lines.append(
+                        f"  lane {item['lane_key']}: waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_unassigned":
+                    lines.append(
+                        f"  lane {item['lane_key']}: waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_multi_owner":
+                    lines.append(
+                        f"  lane {item['lane_key']}: waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_ready_to_close":
+                    lines.append(
+                        f"  lane {item['lane_key']}: closeout / {item['reason']}"
+                    )
+                elif item["type"] == "lane_partial_completion":
+                    lines.append(
+                        f"  lane {item['lane_key']}: partial / {item['reason']}"
+                    )
+                elif item["type"] == "lane_review_queue":
+                    lines.append(
+                        f"  lane {item['lane_key']}: review / waiting={item['waiting']} / {item['reason']}"
+                    )
+                elif item["type"] == "lane_quality_queue":
+                    lines.append(
+                        f"  lane {item['lane_key']}: qa / waiting={item['waiting']} / {item['reason']}"
+                    )
         if self._stuck_reports:
             lines.extend(["", "Stuck Reports:"])
             for report in self._stuck_reports.values():
                 lines.append(f"  {report.task_id}: {report.summary}")
         return "\n".join(lines)
 
-    def artifacts_summary(self, task_id: str) -> str:
-        return self.artifact_store.format_for_task(task_id)
+    def control_plane_summary(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+        lane_summaries: list[dict] | None = None,
+    ) -> dict:
+        inflight_task_ids = set(inflight_task_ids or set())
+        waiting_task_ids = set(waiting_task_ids or set())
+        tasks = self.task_tracker.list_active(chat_id)
+        task_states = [
+            self.task_tracker._runtime_state_label(
+                task,
+                inflight_task_ids=inflight_task_ids,
+                waiting_task_ids=waiting_task_ids,
+                task_stage_sla_seconds=self.task_stage_sla_seconds,
+            )
+            for task in tasks
+        ]
+        families = self._family_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        sessions = self._session_rollups_with_actions(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        presence = self.agent_presence(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        proactive = self.proactive_recommendations(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            lane_summaries=lane_summaries,
+        )
+        filtered_lanes = self.lane_runtime_summaries(
+            chat_id,
+            lane_summaries or [],
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+        )
+        return {
+            "tasks_total": len(tasks),
+            "tasks_inflight": task_states.count("inflight"),
+            "tasks_waiting": task_states.count("waiting"),
+            "tasks_blocked": task_states.count("blocked"),
+            "tasks_stale": task_states.count("stale"),
+            "families_total": len(families),
+            "families_ready_to_close": sum(1 for item in families if item.get("ready_to_close")),
+            "sessions_total": len(sessions),
+            "sessions_ready_to_close": sum(1 for item in sessions if item.get("ready_to_close")),
+            "lanes_total": len(filtered_lanes),
+            "lanes_congested": sum(1 for item in filtered_lanes if item.get("inflight", 0) > 0 and item.get("waiting", 0) > 0),
+            "lanes_waiting": sum(item.get("waiting", 0) for item in filtered_lanes),
+            "lanes_blocked": sum(1 for item in filtered_lanes if item.get("head_blocked_reason")),
+            "lanes_ready_to_close": sum(1 for item in filtered_lanes if item.get("ready_to_close")),
+            "agents_total": len(presence),
+            "agents_busy": sum(1 for item in presence if item.get("presence") == "busy"),
+            "agents_blocked": sum(1 for item in presence if item.get("presence") == "blocked"),
+            "agents_waiting": sum(1 for item in presence if item.get("presence") == "waiting"),
+            "agents_idle": sum(1 for item in presence if item.get("presence") == "idle"),
+            "proactive_total": len(proactive),
+        }
+
+    def control_plane_text(
+        self,
+        chat_id: int,
+        inflight_task_ids: set[str] | None = None,
+        waiting_task_ids: set[str] | None = None,
+        lane_summaries: list[dict] | None = None,
+    ) -> str:
+        summary = self.control_plane_summary(
+            chat_id,
+            inflight_task_ids=inflight_task_ids,
+            waiting_task_ids=waiting_task_ids,
+            lane_summaries=lane_summaries,
+        )
+        lines = ["🧠 Control Plane Summary", ""]
+        lines.append(
+            f"Tasks: total={summary['tasks_total']} inflight={summary['tasks_inflight']} waiting={summary['tasks_waiting']} blocked={summary['tasks_blocked']} stale={summary['tasks_stale']}"
+        )
+        lines.append(
+            f"Families: total={summary['families_total']} ready_to_close={summary['families_ready_to_close']}"
+        )
+        lines.append(
+            f"Sessions: total={summary['sessions_total']} ready_to_close={summary['sessions_ready_to_close']}"
+        )
+        lines.append(
+            f"Lanes: total={summary['lanes_total']} congested={summary['lanes_congested']} waiting_jobs={summary['lanes_waiting']}"
+        )
+        lines.append(
+            f"Lane Closeout: ready={summary['lanes_ready_to_close']} blocked={summary['lanes_blocked']}"
+        )
+        lines.append(
+            f"Agents: total={summary['agents_total']} busy={summary['agents_busy']} blocked={summary['agents_blocked']} waiting={summary['agents_waiting']} idle={summary['agents_idle']}"
+        )
+        lines.append(f"Proactive: total={summary['proactive_total']}")
+        return "\n".join(lines)
+
+    def _latest_route_summary(self, task_id: str) -> str:
+        return self._latest_route_summary_for_chat(task_id, None)
+
+    def _latest_route_summary_for_chat(self, task_id: str, chat_id: int | None) -> str:
+        events = self.event_store.read_all()
+        for event in reversed(events):
+            if (
+                event.task_id != task_id
+                or event.type != "route_decision"
+                or (chat_id is not None and event.chat_id != chat_id)
+            ):
+                continue
+            reason = event.payload.get("reason", "unknown")
+            agent = event.payload.get("agent", "unknown")
+            return f"{reason} -> @{agent}"
+        return "(无 route decision)"
+
+    def _latest_gate_summary(self, task_id: str) -> str:
+        return self._latest_gate_summary_for_chat(task_id, None)
+
+    def _latest_gate_summary_for_chat(self, task_id: str, chat_id: int | None) -> str:
+        for artifact in reversed(self.artifact_store.list_for_task(task_id, chat_id=chat_id)):
+            if artifact.type != "gate_decision":
+                continue
+            return artifact.summary
+        return "(无 gate decision)"
+
+    def _latest_continuation_summary(self, task_id: str) -> str:
+        return self._latest_continuation_summary_for_chat(task_id, None)
+
+    def _latest_continuation_summary_for_chat(self, task_id: str, chat_id: int | None) -> str:
+        for artifact in reversed(self.artifact_store.list_for_task(task_id, chat_id=chat_id)):
+            if artifact.type != "continuation_checkpoint":
+                continue
+            return artifact.summary
+        return "(无 continuation)"
+
+    def gate_summary(self, task_id: str, chat_id: int | None = None) -> str:
+        gates = [
+            artifact for artifact in self.artifact_store.list_for_task(task_id, chat_id=chat_id)
+            if artifact.type == "gate_decision"
+        ]
+        if not gates:
+            return "(无 gate decisions)"
+        lines = ["🚦 Gate Decisions：", ""]
+        for artifact in gates[-8:]:
+            lines.append(f"  [{artifact.source}] {artifact.summary}")
+        return "\n".join(lines)
+
+    def continuation_summary(self, task_id: str, chat_id: int | None = None) -> str:
+        artifacts = [
+            artifact for artifact in self.artifact_store.list_for_task(task_id, chat_id=chat_id)
+            if artifact.type == "continuation_checkpoint"
+        ]
+        if not artifacts:
+            return "(无 continuation checkpoint)"
+        latest = artifacts[-1]
+        return latest.content or latest.summary
+
+    def _latest_continuation_record(self, task_id: str) -> dict[str, str]:
+        return self._latest_continuation_record_for_chat(task_id, None)
+
+    def _latest_continuation_record_for_chat(self, task_id: str, chat_id: int | None) -> dict[str, str]:
+        artifacts = [
+            artifact for artifact in self.artifact_store.list_for_task(task_id, chat_id=chat_id)
+            if artifact.type == "continuation_checkpoint"
+        ]
+        if not artifacts:
+            return {}
+        content = artifacts[-1].content or ""
+        record: dict[str, str] = {}
+        for line in content.splitlines():
+            if ": " not in line:
+                continue
+            key, value = line.split(": ", 1)
+            record[key.strip()] = value.strip()
+        return record
+
+    def _latest_continuation_next_action(self, task_id: str) -> str:
+        record = self._latest_continuation_record(task_id)
+        return record.get("Next Action", "")
+
+    def _latest_continuation_next_action_for_chat(self, task_id: str, chat_id: int | None) -> str:
+        record = self._latest_continuation_record_for_chat(task_id, chat_id)
+        return record.get("Next Action", "")
+
+    def _pm_reply_rejects_acceptance(self, reply: str) -> bool:
+        return any(keyword in reply for keyword in ("验收不通过", "拒绝验收"))
+
+    def _pm_reply_accepts_acceptance(self, reply: str) -> bool:
+        negative_markers = (
+            "未完成",
+            "尚未完成",
+            "还未完成",
+            "没有完成",
+            "未验收通过",
+            "尚未验收通过",
+            "未通过验收",
+            "需要继续验证",
+            "继续验证",
+        )
+        if any(marker in reply for marker in negative_markers):
+            return False
+        if any(marker in reply for marker in ("验收通过", "通过验收", "任务完成", "已完成", "完成验收")):
+            return True
+        return bool(re.search(r"\bDONE\b", reply, re.IGNORECASE))
+
+    def _task_chat_id_for_task(self, task) -> int:
+        if task is None:
+            return 0
+        session_key = getattr(task, "session_key", "") or ""
+        match = re.match(r"chat:(-?\d+):task:", session_key)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+        for chat_id, tasks in self.task_tracker._tasks.items():
+            if tasks.get(task.id) is task:
+                return chat_id
+        return self._task_chat_id(task.id)
+
+    def _continuation_resume_message(self, task) -> str:
+        record = self._latest_continuation_record(task.id)
+        if not record:
+            return task.description
+        next_action = record.get("Next Action") or "continue task"
+        return (
+            f"[RESUME from continuation]\n"
+            f"Task: {task.id}\n"
+            f"Goal: {record.get('Goal', task.description)}\n"
+            f"Current State: {record.get('Current State', task.status.value)}\n"
+            f"Owner: {record.get('Owner', '@未分配')}\n"
+            f"Family: {record.get('Family', getattr(task, 'family_id', task.id) or task.id)}\n"
+            f"Next Action: {next_action}\n"
+            f"Constraints: {record.get('Constraints', '(none)')}\n"
+            f"Artifacts: {record.get('Artifacts', '(none)')}\n"
+            f"Stop Conditions: {record.get('Stop Conditions', '(none)')}"
+        )
+
+    def _continuation_resume_agent(self, task):
+        record = self._latest_continuation_record(task.id)
+        next_action = (record.get("Next Action", "") or "").lower()
+        owner = (record.get("Owner", "") or "").lstrip("@")
+        if "architect review" in next_action or "await review verdict" in next_action:
+            agent = self.registry.get_by_role("architect")
+            if agent is not None:
+                return agent
+        if "qa quality gate" in next_action:
+            agent = self.registry.get_by_role("qa")
+            if agent is not None:
+                return agent
+        if "pm acceptance" in next_action or "request human decision" in next_action:
+            agent = self.router.default_agent()
+            if agent is not None:
+                return agent
+        if owner:
+            agent = self.registry.get_by_name(owner)
+            if agent is not None:
+                return agent
+        return self.router.detect_first(task.description) or self.router.default_agent()
+
+    def _append_gate_decision_artifact(self, task, run_id: str, agent, reply: str) -> None:
+        if task is None:
+            return
+        gate_stage = ""
+        verdict = ""
+        upper = reply.upper()
+        if agent.role == "architect":
+            gate_stage = "review"
+            if "LGTM" in upper:
+                verdict = "approved"
+            elif any(keyword in reply for keyword in ("打回", "修复", "reject")):
+                verdict = "changes_requested"
+            elif "未给出有效评审结论" in reply:
+                verdict = "noncompliant"
+        elif agent.role == "qa":
+            gate_stage = "quality_gate"
+            if "NO-GO" in upper or "NO GO" in upper or "阻断" in reply:
+                verdict = "blocked"
+            elif "GO" in upper:
+                verdict = "approved"
+            elif "未给出有效测试结论" in reply:
+                verdict = "noncompliant"
+        elif agent.role == "pm":
+            gate_stage = "acceptance"
+            if self._pm_reply_accepts_acceptance(reply):
+                verdict = "accepted"
+            elif self._pm_reply_rejects_acceptance(reply):
+                verdict = "rejected"
+        if not gate_stage or not verdict:
+            return
+        task_chat_id = self._task_chat_id_for_task(task)
+        self.artifact_store.append(ArtifactRecord(
+            task_id=task.id,
+            run_id=run_id,
+            type="gate_decision",
+            source=agent.name,
+            summary=f"{gate_stage}:{verdict}",
+            chat_id=task_chat_id,
+            content=json.dumps(
+                {
+                    "stage": gate_stage,
+                    "verdict": verdict,
+                    "agent": agent.name,
+                    "task_id": task.id,
+                    "session_key": getattr(task, "session_key", "") or f"chat:{task_chat_id}:task:{task.id}",
+                    "family_id": getattr(task, "family_id", "") or task.id,
+                    "blocked_reason": getattr(task, "blocked_reason", ""),
+                    "reply": reply[:500],
+                },
+                ensure_ascii=False,
+            ),
+        ))
+        self._record_event(
+            run_id,
+            task_chat_id,
+            "gate_decision",
+            agent.name,
+            task,
+            {
+                "stage": gate_stage,
+                "verdict": verdict,
+                "task_id": task.id,
+                "session_key": getattr(task, "session_key", "") or f"chat:{task_chat_id}:task:{task.id}",
+                "family_id": getattr(task, "family_id", "") or task.id,
+                "blocked_reason": getattr(task, "blocked_reason", ""),
+            },
+        )
+
+    def _append_continuation_artifact(self, task, run_id: str) -> None:
+        if task is None:
+            return
+        content = "\n".join(
+            [
+                f"Goal: {task.description}",
+                f"Session: {getattr(task, 'session_key', '') or '(none)'}",
+                f"Current State: {task.status.value}",
+                f"Owner: @{task.assigned_to or '未分配'}",
+                f"Family: {getattr(task, 'family_id', '') or task.id}",
+                f"Next Action: {self._next_action_summary(task)}",
+                f"Constraints: blocked={getattr(task, 'blocked_reason', '') or '(none)'}",
+                f"Artifacts: route={self._latest_route_summary_for_chat(task.id, self._task_chat_id_for_task(task))}; gate={self._latest_gate_summary_for_chat(task.id, self._task_chat_id_for_task(task))}; branch={task.branch_name or '(none)'}; pr={task.github_pr_url or '(none)'}",
+                f"Stop Conditions: {self._stop_condition_summary(task)}",
+            ]
+        )
+        self.artifact_store.append(
+            ArtifactRecord(
+                task_id=task.id,
+                run_id=run_id,
+                type="continuation_checkpoint",
+                source="system",
+                summary=f"continuation:{task.status.value}",
+                chat_id=self._task_chat_id_for_task(task),
+                content=content,
+            )
+        )
+
+    def _next_action_summary(self, task) -> str:
+        blocked = getattr(task, "blocked_reason", "")
+        if blocked == "approval_required":
+            return "wait for approval or operator intervention"
+        if blocked == "human_input_required":
+            return "request human decision"
+        if blocked in {"review_changes_requested", "review_replan_required"}:
+            return "return to PM/Dev for review follow-up"
+        if blocked in {"quality_gate_blocked", "quality_gate_replan_required"}:
+            return "repair quality gate blockers"
+        if blocked == "acceptance_rejected":
+            return "re-plan and re-implement against acceptance feedback"
+        if task.status == TaskStatus.REVIEW_REQ:
+            return "architect review"
+        if task.status == TaskStatus.REVIEWING:
+            return "await review verdict"
+        if task.status == TaskStatus.ACCEPTED:
+            qa = self.registry.get_by_role("qa")
+            return "qa quality gate" if qa else "pm acceptance"
+        if task.status == TaskStatus.VALIDATING:
+            return "pm acceptance / release readiness"
+        if task.status == TaskStatus.DONE:
+            return "no action required"
+        return "continue implementation"
+
+    def _stop_condition_summary(self, task) -> str:
+        blocked = getattr(task, "blocked_reason", "")
+        if blocked:
+            return f"stop until {blocked} is resolved"
+        if task.status == TaskStatus.DONE:
+            return "task complete"
+        return "continue until next gate or explicit blocker"
+
+    def family_summary(self, chat_id: int, family_id: str) -> str:
+        members = self.task_tracker.family_members(chat_id, family_id)
+        if not members:
+            return f"未找到 family: {family_id}"
+        rollups = self._family_rollups_with_actions(chat_id)
+        state = next((item["state"] for item in rollups if item["family_id"] == family_id), "active")
+        blocked = next((item.get("blocked_reasons", []) for item in rollups if item["family_id"] == family_id), [])
+        next_actions = next((item.get("next_actions", []) for item in rollups if item["family_id"] == family_id), [])
+        completion = self.task_tracker.family_completion_state(chat_id, family_id)
+        lines = [f"Family: {family_id}", ""]
+        lines.append(f"State: {state}")
+        lines.append(f"Completion: {completion}")
+        lines.append(f"Blocked Reasons: {', '.join(blocked) or '(none)'}")
+        lines.append(f"Next Actions: {', '.join(next_actions) or '(none)'}")
+        lines.append("")
+        for task in members:
+            lines.append(
+                f"- {task.id} status={task.status.value} assigned=@{task.assigned_to or '未分配'} blocked={getattr(task, 'blocked_reason', '') or '(无)'}"
+            )
+        return "\n".join(lines)
+
+    def session_summary(self, chat_id: int, session_key: str) -> str:
+        members = [
+            task for task in self.task_tracker.list_all(chat_id)
+            if getattr(task, "session_key", "") == session_key
+        ]
+        if not members:
+            return f"未找到 session: {session_key}"
+        rollups = self._session_rollups_with_actions(chat_id)
+        blocked = next((item.get("blocked_reasons", []) for item in rollups if item["session_key"] == session_key), [])
+        next_actions = next((item.get("next_actions", []) for item in rollups if item["session_key"] == session_key), [])
+        lines = [f"Session: {session_key}", ""]
+        lines.append(f"Completion: {self.task_tracker.session_completion_state(chat_id, session_key)}")
+        lines.append(f"Blocked Reasons: {', '.join(blocked) or '(none)'}")
+        lines.append(f"Next Actions: {', '.join(next_actions) or '(none)'}")
+        lines.append("")
+        for task in members:
+            lines.append(
+                f"- {task.id} status={task.status.value} family={getattr(task, 'family_id', task.id)} blocked={getattr(task, 'blocked_reason', '') or '(无)'} route={self._latest_route_summary_for_chat(task.id, chat_id)} next={self._latest_continuation_next_action_for_chat(task.id, chat_id) or '(none)'} gate={self._latest_gate_summary_for_chat(task.id, chat_id)}"
+            )
+        return "\n".join(lines)
+
+    def _family_escalation_reason(self, family: dict) -> str:
+        state = family.get("state", "")
+        completion_state = family.get("completion_state", "")
+        blocked_reasons = set(family.get("blocked_reasons", []))
+        if "human_input_required" in blocked_reasons:
+            return "need_human_decision"
+        if "approval_required" in blocked_reasons:
+            return "pending_approval"
+        if completion_state == "partial":
+            return "partial_family_completion"
+        if state == "blocked":
+            return "replan_or_reassign"
+        if state == "stale":
+            return "stale_family_follow_up"
+        if state == "waiting":
+            return "waiting_family_follow_up"
+        return ""
+
+    def artifacts_summary(self, task_id: str, chat_id: int | None = None) -> str:
+        return self.artifact_store.format_for_task(task_id, chat_id=chat_id)
 
     def pr_summary(self, chat_id: int, task_id: str) -> str:
         task = self.task_tracker.get(chat_id, task_id)
@@ -1167,6 +2422,7 @@ class Orchestrator:
         if task is None:
             return
         routing_reply = routing_reply or reply
+        upper = reply.upper()
         if agent.role == "dev" and any(
             keyword in routing_reply for keyword in ("@architect", "Review", "review", "Code Review")
         ):
@@ -1174,7 +2430,7 @@ class Orchestrator:
                 task.transition(TaskStatus.IN_PROGRESS)
             task.transition(TaskStatus.REVIEW_REQ)
         if agent.role == "architect":
-            if "LGTM" in reply.upper():
+            if "LGTM" in upper:
                 if task.status == TaskStatus.REVIEW_REQ:
                     task.transition(TaskStatus.REVIEWING)
                 task.transition(TaskStatus.ACCEPTED)
@@ -1187,12 +2443,64 @@ class Orchestrator:
                 pm = self.router.default_agent()
                 if pm is not None:
                     task.assigned_to = pm.name
-        if agent.role == "pm" and any(keyword in reply for keyword in ("验收通过", "DONE", "完成")):
-            if task.status == TaskStatus.ACCEPTED:
-                task.transition(TaskStatus.VALIDATING)
-            if task.status == TaskStatus.VALIDATING:
-                task.transition(TaskStatus.DONE)
-        self.state_store.save_task(self._task_chat_id(task.id), task)
+        if agent.role == "qa":
+            if "NO-GO" in upper or "NO GO" in upper or "阻断" in reply:
+                task.transition(TaskStatus.IN_PROGRESS)
+            elif "GO" in upper:
+                if task.status == TaskStatus.ACCEPTED:
+                    task.transition(TaskStatus.VALIDATING)
+            elif "未给出有效测试结论" in reply:
+                task.transition(TaskStatus.IN_PROGRESS)
+                pm = self.router.default_agent()
+                if pm is not None:
+                    task.assigned_to = pm.name
+        if agent.role == "pm":
+            if self._pm_reply_rejects_acceptance(reply):
+                if task.status == TaskStatus.ACCEPTED:
+                    task.transition(TaskStatus.VALIDATING)
+                if task.status == TaskStatus.VALIDATING:
+                    task.transition(TaskStatus.IN_PROGRESS)
+            elif self._pm_reply_accepts_acceptance(reply):
+                if task.status == TaskStatus.ACCEPTED:
+                    task.transition(TaskStatus.VALIDATING)
+                if task.status == TaskStatus.VALIDATING:
+                    task.transition(TaskStatus.DONE)
+        self.state_store.save_task(self._task_chat_id_for_task(task), task)
+
+    def _update_task_blocked_reason(self, task, agent, reply: str, routing_reply: str, artifacts) -> None:
+        if task is None:
+            return
+        shell_output = getattr(artifacts, "shell_output", "")
+        shell_failed = self.executor.is_failure(shell_output)
+        upper = reply.upper()
+        if agent.role == "dev":
+            if "[approval required:" in shell_output:
+                task.blocked_reason = "approval_required"
+            elif shell_failed:
+                task.blocked_reason = "validation_failed"
+            elif "Next: @architect review" in routing_reply:
+                task.blocked_reason = ""
+        elif agent.role == "architect":
+            if "LGTM" in upper:
+                task.blocked_reason = ""
+            elif any(keyword in reply for keyword in ("打回", "修复", "reject")):
+                task.blocked_reason = "review_changes_requested"
+            elif "未给出有效评审结论" in reply:
+                task.blocked_reason = "review_replan_required"
+        elif agent.role == "qa":
+            if "NO-GO" in upper or "NO GO" in upper or "阻断" in reply:
+                task.blocked_reason = "quality_gate_blocked"
+            elif "CONDITIONAL GO" in upper or "GO" in upper:
+                task.blocked_reason = ""
+            elif "未给出有效测试结论" in reply:
+                task.blocked_reason = "quality_gate_replan_required"
+        elif agent.role == "pm":
+            if "@HUMAN" in upper:
+                task.blocked_reason = "human_input_required"
+            elif self._pm_reply_rejects_acceptance(reply):
+                task.blocked_reason = "acceptance_rejected"
+            elif self._pm_reply_accepts_acceptance(reply):
+                task.blocked_reason = ""
 
     async def _ensure_dev_branch(self, chat_id: int, task, agent):
         if task is None or agent.role != "dev":
@@ -1270,31 +2578,43 @@ class Orchestrator:
         if not task or not run_id:
             return False
         checkpoint = self.checkpoint_store.load_latest(run_id)
-        if checkpoint is None:
-            return False
         self._paused_tasks.discard((chat_id, task_id))
-        self._histories[chat_id] = list(checkpoint.history)
-        self._dev_retries[chat_id] = checkpoint.dev_retries
-        if checkpoint.task_status:
-            try:
-                task.status = TaskStatus(checkpoint.task_status)
-            except ValueError:
-                pass
-        agent = self.router.detect_first(checkpoint.current_message)
-        if agent is None or agent.name == checkpoint.current_agent:
-            agent = self.registry.get_by_name(checkpoint.current_agent)
-        if agent is None:
-            agent = self.router.detect_first(checkpoint.current_message) or self.router.default_agent()
+        if checkpoint is not None:
+            self._histories[chat_id] = list(checkpoint.history)
+            self._dev_retries[chat_id] = checkpoint.dev_retries
+            if checkpoint.task_status:
+                try:
+                    task.status = TaskStatus(checkpoint.task_status)
+                except ValueError:
+                    pass
+            resume_message = checkpoint.current_message
+            agent = self.router.detect_first(checkpoint.current_message)
+            if agent is None or agent.name == checkpoint.current_agent:
+                agent = self.registry.get_by_name(checkpoint.current_agent)
+            if agent is None:
+                agent = self.router.detect_first(checkpoint.current_message) or self.router.default_agent()
+            hop = checkpoint.hop
+        else:
+            continuation = self._latest_continuation_record(task.id)
+            if not continuation:
+                return False
+            self._histories[chat_id] = list(self._histories.get(chat_id, []))
+            self._dev_retries[chat_id] = self._dev_retries.get(chat_id, 0)
+            resume_message = self._continuation_resume_message(task)
+            agent = self._continuation_resume_agent(task)
+            hop = -1
+            if agent is None:
+                return False
         self._record_event(
             run_id,
             chat_id,
             "run_resumed",
             "system",
             task,
-            {"task_id": task_id, "hop": checkpoint.hop},
+            {"task_id": task_id, "hop": hop},
         )
         await self.run_chain(
-            checkpoint.current_message,
+            resume_message,
             chat_id,
             send,
             initial_agent=agent,
@@ -1308,11 +2628,14 @@ class Orchestrator:
         if not task:
             return False
         self._paused_tasks.discard((chat_id, task_id))
-        agent = self.router.detect_first(task.description) or self.router.default_agent()
+        replay_message = self._continuation_resume_message(task)
+        agent = self._continuation_resume_agent(task)
+        if agent is None:
+            agent = self.router.detect_first(task.description) or self.router.default_agent()
         if agent is None:
             return False
         await self.run_chain(
-            task.description,
+            replay_message,
             chat_id,
             send,
             initial_agent=agent,
@@ -1342,6 +2665,35 @@ class Orchestrator:
         )
         self.event_store.append(event)
         self.state_store.append_event(event)
+
+    def record_route_decision(
+        self,
+        run_id: str,
+        chat_id: int,
+        task,
+        message: str,
+        agent,
+        reason: str,
+    ) -> None:
+        if task is None or agent is None:
+            return
+        self._record_event(
+            run_id,
+            chat_id,
+            "route_decision",
+            "system",
+            task,
+            {
+                "reason": reason,
+                "agent": agent.name,
+                "role": agent.role,
+                "message": message[:240],
+                "task_id": task.id,
+                "session_key": getattr(task, "session_key", "") or f"chat:{chat_id}:task:{task.id}",
+                "family_id": getattr(task, "family_id", "") or task.id,
+                "parent_task_id": getattr(task, "parent_task_id", ""),
+            },
+        )
 
     def _save_checkpoint(
         self,
@@ -1432,13 +2784,13 @@ class Orchestrator:
                 task.status = TaskStatus.IN_PROGRESS
             self.artifact_store.append(ArtifactRecord(
                 task_id=task.id,
-                run_id=self._task_run_ids.get((self._task_chat_id(task.id), task.id), ""),
+                run_id=self._task_run_ids.get((self._task_chat_id_for_task(task), task.id), ""),
                 type="github_pr_event",
                 source="github",
                 summary=f"PR #{number} {action}",
                 content=json.dumps(payload, ensure_ascii=False)[:3000],
             ))
-            self.state_store.save_task(self._task_chat_id(task.id), task)
+            self.state_store.save_task(self._task_chat_id_for_task(task), task)
             return
 
         if event_type == "pull_request_review":
@@ -1454,13 +2806,13 @@ class Orchestrator:
                 task.status = TaskStatus.IN_PROGRESS
             self.artifact_store.append(ArtifactRecord(
                 task_id=task.id,
-                run_id=self._task_run_ids.get((self._task_chat_id(task.id), task.id), ""),
+                run_id=self._task_run_ids.get((self._task_chat_id_for_task(task), task.id), ""),
                 type="github_review_event",
                 source="github",
                 summary=f"review {state or 'submitted'}",
                 content=json.dumps(payload, ensure_ascii=False)[:3000],
             ))
-            self.state_store.save_task(self._task_chat_id(task.id), task)
+            self.state_store.save_task(self._task_chat_id_for_task(task), task)
             return
 
         if event_type == "pull_request_review_comment":
@@ -1470,7 +2822,7 @@ class Orchestrator:
                 return
             self.artifact_store.append(ArtifactRecord(
                 task_id=task.id,
-                run_id=self._task_run_ids.get((self._task_chat_id(task.id), task.id), ""),
+                run_id=self._task_run_ids.get((self._task_chat_id_for_task(task), task.id), ""),
                 type="github_review_comment",
                 source="github",
                 summary=payload.get("action", "comment"),
@@ -1485,7 +2837,7 @@ class Orchestrator:
                 return
             self.artifact_store.append(ArtifactRecord(
                 task_id=task.id,
-                run_id=self._task_run_ids.get((self._task_chat_id(task.id), task.id), ""),
+                run_id=self._task_run_ids.get((self._task_chat_id_for_task(task), task.id), ""),
                 type="github_issue_comment",
                 source="github",
                 summary=payload.get("action", "comment"),
@@ -1503,7 +2855,7 @@ class Orchestrator:
                 self._ci_overrides[task.id] = summary
                 self.artifact_store.append(ArtifactRecord(
                     task_id=task.id,
-                    run_id=self._task_run_ids.get((self._task_chat_id(task.id), task.id), ""),
+                    run_id=self._task_run_ids.get((self._task_chat_id_for_task(task), task.id), ""),
                     type="ci_event",
                     source="github",
                     summary=summary.summary,
@@ -1570,6 +2922,10 @@ class Orchestrator:
                 description=record["description"],
                 status=status,
                 assigned_to=record["assigned_to"],
+                session_key=record.get("session_key") or f"chat:{record['chat_id']}:task:{record['id']}",
+                family_id=record.get("family_id") or record["id"],
+                parent_task_id=record.get("parent_task_id", ""),
+                blocked_reason=record.get("blocked_reason", ""),
                 branch_name=record["branch_name"],
                 github_issue_number=record["github_issue_number"],
                 github_issue_url=record["github_issue_url"],
@@ -1585,11 +2941,14 @@ class Orchestrator:
             self.task_tracker.restore(record["chat_id"], restored)
 
     def _task_chat_id(self, task_id: str) -> int:
+        matches = []
         for chat_id, tasks in self.task_tracker._tasks.items():
             if task_id in tasks:
-                return chat_id
+                matches.append(chat_id)
+        if len(matches) == 1:
+            return matches[0]
         return 0
 
-    def trace_summary(self, task_id: str) -> str:
+    def trace_summary(self, task_id: str, chat_id: int | None = None) -> str:
         from .trace.store import TraceStore
-        return TraceStore(self.event_store).format_task_timeline(task_id)
+        return TraceStore(self.event_store).format_task_timeline(task_id, chat_id=chat_id)

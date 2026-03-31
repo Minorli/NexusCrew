@@ -8,8 +8,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-openspec/
+openspec/changes/archive/
 AGENTS.md
+!openspec/AGENTS.md
 0.start.txt
 1.prompts.txt
 DESIGN.md

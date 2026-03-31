@@ -38,7 +38,7 @@ class RecoveryManager:
                 replay_ok = await self.orchestrator.replay_task(chat_id, task_id, send)
                 if not replay_ok:
                     raise RuntimeError(f"resume/replay failed for {task_id}")
-            if self.runner.resume_existing(job.id, resume_coro()):
+            if self.runner.resume_existing(job.id, resume_coro(), lane_key=getattr(job, "lane_key", "")):
                 self.runner.mark_status(job.id, "running")
                 recovered.append(job.id)
         await asyncio.sleep(0)
